@@ -28,10 +28,11 @@ Experimental on-console HID driver focussing on providing third party, non xinpu
 
 ## How to build
 1. Acquire the official Xbox 360 SDK using black magic
-2. Install visual studio 2010 ultimate and visual studio 2019
+2. Install visual studio 2010 ultimate and visual studio 2022
 3. Install the sdk using the "FULL" preset
-4. Open the solution in visual studio 2019 and build
-5. Hopefully enjoy :)
+4. Register the Xbox 360 platform with visual studio 2022 by running `vs2022\Install-Xbox360Platform.ps1` (approve the UAC prompt - writing into the VS installation folder requires administrator rights). The script copies the XDK's MSBuild platform files into VS2022 and installs bridge files that teach VS2022 about the `Xbox 360` platform and its `2010-01` toolset. Re-run it if a VS2022 reinstall/update removes the platform. If auto-detection fails, pass your VS2022 path manually: `.\vs2022\Install-Xbox360Platform.ps1 -VsPath "C:\Path\to\VS2022"`
+5. Open the solution in visual studio 2022 and build (decline any offer to upgrade/retarget the project - the platform toolset must stay `2010-01`)
+6. Hopefully enjoy :)
 
 ## Showcase
 https://github.com/user-attachments/assets/f090e5f4-538d-457f-8189-2c5b98579984

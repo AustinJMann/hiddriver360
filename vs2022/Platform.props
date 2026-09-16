@@ -1,0 +1,32 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- VS2022 bridge: forward to the Xbox 360 XDK platform props (v4.0-style name) -->
+  <Import Project="$(MSBuildThisFileDirectory)Microsoft.Cpp.Xbox 360.props"/>
+
+  <!-- VS2022 compat: in the VS2010-era flow these build-phase properties were supplied by
+       Microsoft.Cpp.props (v4.0) before the platform props ran. VS2022 sets them in
+       Microsoft.Cpp.Common.props, which only the native platforms import. Without
+       LinkCompiled, VS2022's _Link orchestration target is silently skipped. -->
+  <PropertyGroup Condition="'$(ConfigurationType)' == 'Application'">
+    <LinkCompiled Condition="'$(LinkCompiled)' == ''">true</LinkCompiled>
+    <TargetExt Condition="'$(TargetExt)' == ''">.exe</TargetExt>
+    <OutputType Condition="'$(OutputType)' == ''">exe</OutputType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(ConfigurationType)' == 'DynamicLibrary'">
+    <LinkCompiled Condition="'$(LinkCompiled)' == ''">true</LinkCompiled>
+    <ImpLibCompiled Condition="'$(GenerateImportLib)'=='true' and '$(ImpLibCompiled)' == ''">true</ImpLibCompiled>
+    <TargetExt Condition="'$(TargetExt)' == ''">.dll</TargetExt>
+    <OutputType Condition="'$(OutputType)' == ''">library</OutputType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(ConfigurationType)' == 'StaticLibrary'">
+    <LibCompiled Condition="'$(LibCompiled)' == ''">true</LibCompiled>
+    <TargetExt Condition="'$(TargetExt)' == ''">.lib</TargetExt>
+    <OutputType Condition="'$(OutputType)' == ''">staticlibrary</OutputType>
+  </PropertyGroup>
+
+  <!-- VS2022 compat: supply tool metadata defaults the XDK props never set (the v4.0 flow
+       imported Microsoft.Cl.Common.props / Microsoft.Link.Common.props from the v4.0 folder).
+       All defaults are conditioned on being unset, and the XDK props above already applied
+       their own defaults first, so XDK behavior takes precedence. -->
+  <Import Project="$(VCTargetsPath)\Microsoft.Cl.Common.props"/>
+  <Import Project="$(VCTargetsPath)\Microsoft.Link.Common.props"/>
+</Project>
