@@ -30,6 +30,14 @@ static const int kSlotCount = 4;
 static const uint32_t kHeartbeatIntervalMs = 2000;
 static const uint32_t kHeartbeatRetryMs = 250;
 static const uint16_t kMaxHidPacketSize = 64;
+static const uint16_t kConfigurationDescriptorBufferSize = 512;
+
+enum ControlPurpose {
+	kControlNone,
+	kControlGetConfigurationDescriptor,
+	kControlSetConfiguration,
+	kControlLizardOff
+};
 
 struct ProteusSlot {
 	deviceHandle* handle;
@@ -41,20 +49,29 @@ struct ProteusSlot {
 	usb_endpoint_descriptor endpointDescriptor;
 	uint32_t heartbeatDeadline;
 	uint32_t retryDelay;
+	uint8_t featureFailureCount;
 	bool listening;
+	bool inputPending;
 	bool connected;
+	bool heartbeatEnabled;
 	bool controlBusy;
+	ControlPurpose controlPurpose;
 	bool configurationPending;
 	bool loggedFirstReport;
 	bool loggedFirstState;
 	bool loggedInputQueueResult;
 	bool loggedControlQueueResult;
+	bool loggedInputCompletion;
+	bool loggedLizardSuccess;
 	bool removing;
 };
 
 static ProteusSlot g_slots[kSlotCount];
 static bool g_configurationBusy;
 static bool g_configured;
+static bool g_configurationDescriptorFetched;
+static uint8_t g_configurationDescriptor[kConfigurationDescriptorBufferSize];
+static usb_endpoint_descriptor g_slotEndpointDescriptors[kSlotCount];
 
 static uint16_t Swap16(uint16_t value) {
 	return (uint16_t)((value >> 8) | (value << 8));
@@ -78,8 +95,9 @@ static int32_t InputComplete(DWORD trbAddress, int32_t status);
 static int32_t ControlComplete(DWORD trbAddress, int32_t status);
 static void StartNextConfiguration();
 
-static void QueueControl(ProteusSlot* slot, uint8_t requestType, uint8_t request,
-	uint16_t value, uint16_t index, uint16_t length, void* data) {
+static void QueueControl(ProteusSlot* slot, ControlPurpose purpose,
+	uint8_t requestType, uint8_t request, uint16_t value,
+	uint16_t index, uint16_t length, void* data) {
 	if (!slot || slot->removing || slot->controlBusy) return;
 	UsbControlTrb* control = &slot->extension->controlTrb;
 	control->packet.bmRequestType = requestType;
@@ -93,6 +111,7 @@ static void QueueControl(ProteusSlot* slot, uint8_t requestType, uint8_t request
 	control->trb.callback = (DWORD)ControlComplete;
 	control->trb.savedEndpoint = control->trb.endpoint;
 	slot->controlBusy = true;
+	slot->controlPurpose = purpose;
 	int queueToken = UsbdQueueAsyncTransfer(slot->handle, control);
 	if (!slot->loggedControlQueueResult) {
 		slot->loggedControlQueueResult = true;
@@ -103,8 +122,42 @@ static void QueueControl(ProteusSlot* slot, uint8_t requestType, uint8_t request
 
 static void QueueLizardOff(ProteusSlot* slot) {
 	TritonProtocol::BuildLizardOffFeatureReport(slot->featureReport);
-	QueueControl(slot, 0x21, 0x09, 0x0301, slot->interfaceNumber,
+	QueueControl(slot, kControlLizardOff, 0x21, 0x09, 0x0301, slot->interfaceNumber,
 		TritonProtocol::kFeatureReportSize, slot->featureReport);
+}
+
+static void ParseConfigurationDescriptor() {
+	memset(g_slotEndpointDescriptors, 0, sizeof(g_slotEndpointDescriptors));
+	uint16_t totalLength = TritonProtocol::ReadLE16(g_configurationDescriptor + 2);
+	if (totalLength > kConfigurationDescriptorBufferSize)
+		totalLength = kConfigurationDescriptorBufferSize;
+	uint8_t currentInterface = 0xff;
+	uint16_t offset = 0;
+	while (offset + 2 <= totalLength) {
+		uint8_t length = g_configurationDescriptor[offset];
+		uint8_t type = g_configurationDescriptor[offset + 1];
+		if (length < 2 || offset + length > totalLength) break;
+		if (type == 0x04 && length >= sizeof(usb_interface_descriptor)) {
+			const usb_interface_descriptor* descriptor =
+				(const usb_interface_descriptor*)(g_configurationDescriptor + offset);
+			currentInterface = descriptor->bInterfaceNumber;
+		} else if (type == 0x05 && length >= 7 &&
+			currentInterface >= TritonProtocol::kFirstSlotInterface &&
+			currentInterface <= TritonProtocol::kLastSlotInterface) {
+			const usb_endpoint_descriptor* endpoint =
+				(const usb_endpoint_descriptor*)(g_configurationDescriptor + offset);
+			if ((endpoint->bEndpointAddress & 0x80) && (endpoint->bmAttributes & 3) == 3) {
+				int slotIndex = currentInterface - TritonProtocol::kFirstSlotInterface;
+				memset(&g_slotEndpointDescriptors[slotIndex], 0, sizeof(g_slotEndpointDescriptors[slotIndex]));
+				memcpy(&g_slotEndpointDescriptors[slotIndex], endpoint, 7);
+				DbgPrint("EINTIM: Proteus configuration maps interface %d to endpoint %02x size %d interval %d\n",
+					currentInterface, endpoint->bEndpointAddress,
+					TritonProtocol::ReadLE16((const uint8_t*)&endpoint->wMaxPacketSize),
+					endpoint->bInterval);
+			}
+		}
+		offset += length;
+	}
 }
 
 static usb_endpoint_descriptor* ScanInterfaceInterruptInEndpoint(
@@ -117,10 +170,11 @@ static usb_endpoint_descriptor* ScanInterfaceInterruptInEndpoint(
 		uint8_t type = cursor[1];
 		if (length < 2 || cursor + length > limit) break;
 		if (type == 0x04) break;
-		if (type == 0x05 && length >= sizeof(usb_endpoint_descriptor)) {
+		if (type == 0x05 && length >= 7) {
 			const usb_endpoint_descriptor* endpoint = (const usb_endpoint_descriptor*)cursor;
 			if ((endpoint->bEndpointAddress & 0x80) && (endpoint->bmAttributes & 0x03) == 0x03) {
-				memcpy(copy, endpoint, sizeof(*copy));
+				memset(copy, 0, sizeof(*copy));
+				memcpy(copy, endpoint, 7);
 				return copy;
 			}
 		}
@@ -130,6 +184,9 @@ static usb_endpoint_descriptor* ScanInterfaceInterruptInEndpoint(
 }
 
 static bool StartListening(ProteusSlot* slot) {
+	int slotIndex = slot->interfaceNumber - TritonProtocol::kFirstSlotInterface;
+	if (slotIndex >= 0 && slotIndex < kSlotCount && g_slotEndpointDescriptors[slotIndex].bLength)
+		memcpy(&slot->endpointDescriptor, &g_slotEndpointDescriptors[slotIndex], sizeof(slot->endpointDescriptor));
 	usb_endpoint_descriptor* endpoint = &slot->endpointDescriptor;
 	if (endpoint->bLength == 0) {
 		usb_endpoint_descriptor* indexed = UsbdGetEndpointDescriptor(
@@ -165,12 +222,26 @@ static bool StartListening(ProteusSlot* slot) {
 	DbgPrint("EINTIM: Proteus slot interface %d listening endpoint %02x size %d interval %d\n",
 		slot->interfaceNumber, endpoint->bEndpointAddress, packetSize, endpoint->bInterval);
 	QueueInput(slot);
+	slot->heartbeatEnabled = true;
 	slot->heartbeatDeadline = 0;
 	return true;
 }
 
 static void StartNextConfiguration() {
 	if (g_configurationBusy) return;
+	if (!g_configurationDescriptorFetched) {
+		for (int i = 0; i < kSlotCount; ++i) {
+			ProteusSlot* slot = &g_slots[i];
+			if (slot->handle && slot->configurationPending && !slot->removing) {
+				g_configurationBusy = true;
+				memset(g_configurationDescriptor, 0, sizeof(g_configurationDescriptor));
+				QueueControl(slot, kControlGetConfigurationDescriptor,
+					0x80, 0x06, 0x0200, 0, kConfigurationDescriptorBufferSize,
+					g_configurationDescriptor);
+				return;
+			}
+		}
+	}
 	if (g_configured) {
 		for (int i = 0; i < kSlotCount; ++i) {
 			ProteusSlot* slot = &g_slots[i];
@@ -187,7 +258,7 @@ static void StartNextConfiguration() {
 		if (slot->handle && slot->configurationPending && !slot->removing) {
 			slot->configurationPending = false;
 			g_configurationBusy = true;
-			QueueControl(slot, 0x00, 0x09, 1, 0, 0, 0);
+			QueueControl(slot, kControlSetConfiguration, 0x00, 0x09, 1, 0, 0, 0);
 			return;
 		}
 	}
@@ -197,9 +268,25 @@ static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 	HidControllerExtension* extension = ExtensionFromControlTrb((void*)trbAddress);
 	ProteusSlot* slot = FindSlotByHandle(extension ? extension->deviceHandle : 0);
 	if (!slot) return status;
-	slot->controlBusy = false;
-	if (slot->removing) return status;
-	if (!slot->listening) {
+	ControlPurpose purpose = slot->controlPurpose;
+	slot->controlPurpose = kControlNone;
+	if (slot->removing) {
+		slot->controlBusy = false;
+		return status;
+	}
+	if (purpose == kControlGetConfigurationDescriptor) {
+		g_configurationBusy = false;
+		if (status == 0) {
+			ParseConfigurationDescriptor();
+		} else {
+			DbgPrint("EINTIM: Proteus configuration descriptor request failed: %x\n", status);
+		}
+		g_configurationDescriptorFetched = true;
+		slot->controlBusy = false;
+		StartNextConfiguration();
+		return status;
+	}
+	if (purpose == kControlSetConfiguration) {
 		g_configurationBusy = false;
 		if (status == 0) {
 			g_configured = true;
@@ -209,23 +296,51 @@ static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 			DbgPrint("EINTIM: Proteus slot %d configuration failed: %x\n", slot->interfaceNumber, status);
 			slot->configurationPending = true;
 		}
+		slot->controlBusy = false;
 		StartNextConfiguration();
 		return status;
 	}
+	if (purpose != kControlLizardOff) {
+		slot->controlBusy = false;
+		return status;
+	}
 	if (status == 0) {
+		if (!slot->loggedLizardSuccess) {
+			slot->loggedLizardSuccess = true;
+			DbgPrint("EINTIM: Proteus slot %d lizard-off request completed successfully\n",
+				slot->interfaceNumber);
+		}
+		if (!slot->inputPending) {
+			DbgPrint("EINTIM: Proteus slot %d arming input after raw-mode success\n",
+				slot->interfaceNumber);
+			QueueInput(slot);
+		}
 		slot->retryDelay = kHeartbeatRetryMs;
+		slot->featureFailureCount = 0;
+		slot->heartbeatEnabled = true;
 		slot->heartbeatDeadline = GetTickCount() + kHeartbeatIntervalMs;
 	} else {
-		DbgPrint("EINTIM: Proteus slot %d lizard-off request failed: %x\n", slot->interfaceNumber, status);
+		++slot->featureFailureCount;
+		if (slot->featureFailureCount <= 3 || slot->connected)
+			DbgPrint("EINTIM: Proteus slot %d lizard-off request failed: %x\n", slot->interfaceNumber, status);
+		if (!slot->connected && slot->featureFailureCount >= 3) {
+			slot->heartbeatEnabled = false;
+			DbgPrint("EINTIM: Proteus slot %d empty; pausing lizard probes until wireless activity\n",
+				slot->interfaceNumber);
+			slot->controlBusy = false;
+			return status;
+		}
 		slot->heartbeatDeadline = GetTickCount() + slot->retryDelay;
 		if (slot->retryDelay < kHeartbeatIntervalMs) slot->retryDelay *= 2;
 		if (slot->retryDelay > kHeartbeatIntervalMs) slot->retryDelay = kHeartbeatIntervalMs;
 	}
+	MemoryBarrier();
+	slot->controlBusy = false;
 	return status;
 }
 
 static void QueueInput(ProteusSlot* slot) {
-	if (!slot || slot->removing || !slot->listening) return;
+	if (!slot || slot->removing || !slot->listening || slot->inputPending) return;
 	memset(slot->inputBuffer, 0, slot->inputLength);
 	UsbTrb* trb = &slot->extension->interruptTrb;
 	trb->buffer = slot->inputBuffer;
@@ -234,6 +349,7 @@ static void QueueInput(ProteusSlot* slot) {
 	trb->callback = (DWORD)InputComplete;
 	trb->savedEndpoint = trb->endpoint;
 	int queueToken = UsbdQueueAsyncTransfer(slot->handle, trb);
+	slot->inputPending = true;
 	if (!slot->loggedInputQueueResult) {
 		slot->loggedInputQueueResult = true;
 		DbgPrint("EINTIM: Proteus slot %d input transfer queued token %x endpoint %02x\n",
@@ -245,6 +361,12 @@ static int32_t InputComplete(DWORD trbAddress, int32_t status) {
 	HidControllerExtension* extension = ExtensionFromInterruptTrb((void*)trbAddress);
 	ProteusSlot* slot = FindSlotByHandle(extension ? extension->deviceHandle : 0);
 	if (!slot || slot->removing) return status;
+	slot->inputPending = false;
+	if (!slot->loggedInputCompletion) {
+		slot->loggedInputCompletion = true;
+		DbgPrint("EINTIM: Proteus slot %d first input completion status %x\n",
+			slot->interfaceNumber, status);
+	}
 	if (status != 0) {
 		if (slot->connected) ProteusDisconnectController(slot->interfaceNumber);
 		slot->connected = false;
@@ -267,15 +389,24 @@ static int32_t InputComplete(DWORD trbAddress, int32_t status) {
 		}
 		ButtonsReport report;
 		TritonProtocol::ConvertToButtonsReport(input, &report);
+		bool wasConnected = slot->connected;
 		slot->connected = true;
+		slot->heartbeatEnabled = true;
+		if (!wasConnected)
+			slot->heartbeatDeadline = 0;
 		ProteusPublishState(slot->interfaceNumber, report);
 	} else if (TritonProtocol::DecodeWirelessStatus(slot->inputBuffer, slot->inputLength, &wireless)) {
 		if (wireless == TritonProtocol::kWirelessDisconnected) {
 			slot->connected = false;
+			slot->heartbeatEnabled = false;
 			ProteusDisconnectController(slot->interfaceNumber);
 		} else {
+			bool wasConnected = slot->connected;
 			slot->connected = true;
-			slot->heartbeatDeadline = 0;
+			slot->featureFailureCount = 0;
+			slot->heartbeatEnabled = true;
+			if (!wasConnected)
+				slot->heartbeatDeadline = 0;
 		}
 	}
 	QueueInput(slot);
@@ -343,6 +474,9 @@ bool ProteusRemoveSlotInterface(deviceHandle* handle) {
 	if (!anySlotsRemain) {
 		g_configurationBusy = false;
 		g_configured = false;
+		g_configurationDescriptorFetched = false;
+		memset(g_configurationDescriptor, 0, sizeof(g_configurationDescriptor));
+		memset(g_slotEndpointDescriptors, 0, sizeof(g_slotEndpointDescriptors));
 	}
 	return true;
 }
@@ -350,7 +484,8 @@ bool ProteusRemoveSlotInterface(deviceHandle* handle) {
 void ProteusMaintenance(uint32_t nowMilliseconds) {
 	for (int i = 0; i < kSlotCount; ++i) {
 		ProteusSlot* slot = &g_slots[i];
-		if (!slot->handle || slot->removing || !slot->listening || slot->controlBusy) continue;
+		if (!slot->handle || slot->removing || !slot->listening ||
+			!slot->heartbeatEnabled || slot->controlBusy) continue;
 		if ((int32_t)(nowMilliseconds - slot->heartbeatDeadline) >= 0)
 			QueueLizardOff(slot);
 	}

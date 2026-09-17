@@ -247,8 +247,8 @@ struct ProteusPendingSlot {
 	volatile LONG connected;
 };
 ProteusPendingSlot g_proteusPending[4];
-int g_activeProteusInterface = -1;
-int g_proteusControllerIndex = -1;
+volatile int g_activeProteusInterface = -1;
+volatile int g_proteusControllerIndex = -1;
 
 int interruptHandler(DWORD deviceHandle, int32_t a2);
 
@@ -646,6 +646,7 @@ void HidFillButtonsReport(
 }
 
 unsigned int __stdcall MappingThreadProc(void* param);
+static void PublishControllerState(Controller& controller, const ButtonsReport& state);
 
 void ProteusPublishState(uint8_t interfaceNumber, const ButtonsReport& state) {
 	if (interfaceNumber < 2 || interfaceNumber > 5) return;
@@ -653,6 +654,16 @@ void ProteusPublishState(uint8_t interfaceNumber, const ButtonsReport& state) {
 	slot.state = state;
 	InterlockedExchange(&slot.connected, 1);
 	InterlockedExchange(&slot.hasState, 1);
+
+	// Once XAM publication is established, deliver every USB report directly to
+	// the lock-free state buffers. Routing gameplay through the 100 ms
+	// maintenance tick loses short presses and adds perceptible latency.
+	int controllerIndex = g_proteusControllerIndex;
+	if (g_activeProteusInterface == interfaceNumber &&
+		controllerIndex >= 0 && controllerIndex < 4 &&
+		connectedControllers[controllerIndex].kind == Controller::TRITON_PROTEUS) {
+		PublishControllerState(connectedControllers[controllerIndex], state);
+	}
 }
 
 void ProteusDisconnectController(uint8_t interfaceNumber) {
