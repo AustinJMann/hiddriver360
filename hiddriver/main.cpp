@@ -11,6 +11,8 @@
 #include "hid_parser.h"  
 #include "usb.h"
 #include "mapping.h"
+#include "driver_types.h"
+#include "proteus.h"
 
 Detour HidAddDeviceDetour;
 Detour HidRemoveDeviceDetour;
@@ -41,61 +43,6 @@ HANDLE MakeThread(LPTHREAD_START_ROUTINE Address, PVOID arg) {
 
 void XNotifyUI(XNOTIFYQUEUEUI_TYPE Type, PWCHAR String) { XNotifyQueueUI(Type, XUSER_INDEX_ANY, XNOTIFYUI_PRIORITY_DEFAULT, String, 0); }
 
-struct UsbTrb {
-	DWORD endpoint;
-	DWORD callback;
-	DWORD savedEndpoint;
-	BYTE  padding[4];
-	BYTE  flags;
-	BYTE  controllerIndex;   // written by UsbdQueueAsyncTransfer
-	BYTE  pad2;
-	BYTE  endpointIndex;     // written by UsbdQueueAsyncTransfer
-	void* buffer;
-	DWORD length;
-};
-
-struct UsbPacket {
-	BYTE  bmRequestType;
-	BYTE  bRequest;
-	WORD  wValue;
-	WORD  wIndex;
-	WORD  wLength;
-};
-
-struct UsbControlTrb {
-	UsbTrb          trb;          
-	BYTE            pad[4];       
-	UsbPacket  packet;  
-};
-
-struct deviceHandle;
-struct __declspec(align(2)) HidControllerExtension
-{
-	deviceHandle* deviceHandle;
-	UsbTrb interruptTrb;
-	BYTE interfaceNumber;
-	BYTE gap20[3];
-	UsbControlTrb controlTrb;
-	BYTE gap4C[4];
-	DWORD cleanupHandler;
-	BYTE gap54[24];
-	DWORD queue;
-	BYTE alwaysOne;
-	BYTE alwaysOneTwo;
-	BYTE unknownFlag;
-	BYTE alwaysZero;
-	BYTE cleanupDone;
-	BYTE initTransferPending;
-	BYTE alwaysZeroTwo;
-	unsigned __int8 deviceType;
-	BYTE alwaysZeroThree;
-	BYTE alwaysZeroFour;
-};
-
-struct deviceHandle {
-	HidControllerExtension* driver;
-};
-
 typedef struct _XINPUT_CAPABILITIESEX
 {
 	BYTE                                Type;
@@ -108,15 +55,6 @@ typedef struct _XINPUT_CAPABILITIESEX
 	DWORD unk3;
 } XINPUT_CAPABILITIES_EX, * PXINPUT_CAPABILITIES_EX;
 
-enum InitState
-{
-	INIT_SET_CONFIGURATION,
-	INIT_GET_REPORT_DESCRIPTOR,
-	INIT_DONE,
-	INIT_FAILED
-};
-
-InitState g_InitState;
 #define USB_ENDPOINT_TYPE_CONTROL     0x00
 #define USB_ENDPOINT_TYPE_ISOCHRONOUS 0x01
 #define USB_ENDPOINT_TYPE_BULK        0x02
@@ -262,6 +200,11 @@ enum NINTENDO_HANDSHAKE_STATE {
 	DONE
 };
 struct Controller {
+	enum Kind {
+		GENERIC_HID,
+		SWITCH_PRO,
+		TRITON_PROTEUS
+	} kind;
 	deviceHandle* deviceHandle;
 	HidControllerExtension* controllerDriver;
 	ButtonsReport currentState;
@@ -274,6 +217,8 @@ struct Controller {
 	uint8_t reportId;
 	void* reportData;
 	const HidDeviceMapping* map;
+	ButtonsReport stateBuffers[2];
+	volatile LONG publishedStateIndex;
 
 	// for nintendo specific handshake
 	NINTENDO_HANDSHAKE_STATE nintendo_handshake_state;
@@ -294,11 +239,16 @@ struct MappingState {
 } __declspec(align(4));
 
 Controller connectedControllers[4];
-Controller c;
-usb_hid_descriptor hidDescriptorBuffer;
-int globalIndex = -1;
-void* reportDescriptorBuffer;
 MappingState g_mappingState;
+
+struct ProteusPendingSlot {
+	ButtonsReport state;
+	volatile LONG hasState;
+	volatile LONG connected;
+};
+ProteusPendingSlot g_proteusPending[4];
+int g_activeProteusInterface = -1;
+int g_proteusControllerIndex = -1;
 
 int interruptHandler(DWORD deviceHandle, int32_t a2);
 
@@ -394,33 +344,42 @@ int32_t noopCompleteHandler(DWORD deviceHandle, int32_t status) {
 }
 
 int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
-	HidControllerExtension* controllerDriver = (HidControllerExtension*)((BYTE*)deviceHandle - 36);
+	HidControllerExtension* controllerDriver = ExtensionFromControlTrb((void*)deviceHandle);
+	if (!controllerDriver || controllerDriver->removing || controllerDriver->controllerIndex < 0 ||
+		controllerDriver->controllerIndex >= 4)
+		return status;
+	Controller& controller = connectedControllers[controllerDriver->controllerIndex];
+	controllerDriver->controlBusy = 0;
 
 	if (status != 0) {
 		DbgPrint("EINTIM: Control transfer failed with status %x!\n", status);
-		g_InitState = INIT_FAILED;
+		controllerDriver->initState = INIT_FAILED;
 		return status;
 	}
 
-	if (g_InitState == InitState::INIT_SET_CONFIGURATION) {
+	if (controllerDriver->initState == INIT_SET_CONFIGURATION) {
 		// SET_CONFIGURATION just completed, now fetch the report descriptor
 		DbgPrint("EINTIM: SET_CONFIGURATION completed. Requesting report descriptor.\n");
 		
 		// Prepare report descriptor buffer
-		hidDescriptorBuffer.wDescriptorLength = swap_endianness_16(hidDescriptorBuffer.wDescriptorLength);
-		DbgPrint("EINTIM: Report descriptor length: %d\n", hidDescriptorBuffer.wDescriptorLength);
+		controllerDriver->reportDescriptorLength = swap_endianness_16(controllerDriver->hidDescriptor.wDescriptorLength);
+		DbgPrint("EINTIM: Report descriptor length: %d\n", controllerDriver->reportDescriptorLength);
 		
-		if (hidDescriptorBuffer.wDescriptorLength == 0) {
+		if (controllerDriver->reportDescriptorLength == 0) {
 			DbgPrint("EINTIM: ERROR - HID descriptor length is 0!\n");
-			g_InitState = INIT_FAILED;
+			controllerDriver->initState = INIT_FAILED;
 			return -1;
 		}
 
-		reportDescriptorBuffer = calloc(1, hidDescriptorBuffer.wDescriptorLength);
+		controllerDriver->reportDescriptorBuffer = calloc(1, controllerDriver->reportDescriptorLength);
+		if (!controllerDriver->reportDescriptorBuffer) {
+			controllerDriver->initState = INIT_FAILED;
+			return -1;
+		}
 
-		g_InitState = InitState::INIT_GET_REPORT_DESCRIPTOR;
+		controllerDriver->initState = INIT_GET_REPORT_DESCRIPTOR;
 		DbgPrint("EINTIM: Fetching report descriptor. Interface: %d, Length: %d\n",
-			controllerDriver->interfaceNumber, hidDescriptorBuffer.wDescriptorLength);
+			controllerDriver->interfaceNumber, controllerDriver->reportDescriptorLength);
 		
 		SendControlRequest(
 			controllerDriver->deviceHandle,
@@ -429,46 +388,44 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 			0x06,
 			0x2200,
 			controllerDriver->interfaceNumber,
-			hidDescriptorBuffer.wDescriptorLength,
-			reportDescriptorBuffer,
+			controllerDriver->reportDescriptorLength,
+			controllerDriver->reportDescriptorBuffer,
 			(DWORD)setConfigurationComplete);
+		controllerDriver->controlBusy = 1;
 	}
-	else if (g_InitState == InitState::INIT_GET_REPORT_DESCRIPTOR) {
+	else if (controllerDriver->initState == INIT_GET_REPORT_DESCRIPTOR) {
 		// Report descriptor request completed
 		DbgPrint("EINTIM: Report descriptor request completed successfully\n");
-		g_InitState = InitState::INIT_DONE;
-
 		HID_ReportInfo_t* reportInfo = nullptr;
-		uint8_t parseResult = USB_ProcessHIDReport((const uint8_t*)reportDescriptorBuffer,
-			hidDescriptorBuffer.wDescriptorLength,
+		uint8_t parseResult = USB_ProcessHIDReport((const uint8_t*)controllerDriver->reportDescriptorBuffer,
+			controllerDriver->reportDescriptorLength,
 			&reportInfo);
-
-		c.reportInfo = reportInfo;
-		c.reportId = FindGamepadReportId(reportInfo);
-
-		DbgPrint("EINTIM: Parsed descriptor. UsingReportIDs: %d, Report ID: %d\r\n",
-			(int)reportInfo->UsingReportIDs, c.reportId);
 
 		if (parseResult != HID_PARSE_Successful || !reportInfo) {
 			DbgPrint("EINTIM: Failed to parse HID descriptor: error %d\r\n", parseResult);
-			g_InitState = InitState::INIT_FAILED;
-			free(reportDescriptorBuffer);
+			controllerDriver->initState = INIT_FAILED;
+			free(controllerDriver->reportDescriptorBuffer);
+			controllerDriver->reportDescriptorBuffer = 0;
 			return -1;
 		}
 
-		DbgPrint("EINTIM: parse done stage 1\r\n");
-		g_InitState = InitState::INIT_DONE;
-
-		c.reportInfo = reportInfo;
-		c.reportId = FindGamepadReportId(reportInfo);
+		controllerDriver->initState = INIT_DONE;
+		controller.reportInfo = reportInfo;
+		controller.reportId = FindGamepadReportId(reportInfo);
 
 		DbgPrint("EINTIM: Parsed descriptor. UsingReportIDs: %d, Report ID: %d\r\n",
-			(int)reportInfo->UsingReportIDs, c.reportId);
+			(int)reportInfo->UsingReportIDs, controller.reportId);
 
-		free(reportDescriptorBuffer);
+		free(controllerDriver->reportDescriptorBuffer);
+		controllerDriver->reportDescriptorBuffer = 0;
 
 		usb_endpoint_descriptor* endpoint_descriptor = UsbdGetEndpointDescriptor(
 			controllerDriver->deviceHandle, 0, USB_ENDPOINT_TYPE_INTERRUPT, USB_DIRECTION_IN);
+		if (!endpoint_descriptor) {
+			DbgPrint("EINTIM: Missing interrupt-IN endpoint\n");
+			controllerDriver->initState = INIT_FAILED;
+			return -1;
+		}
 
 		status = UsbdOpenEndpoint(
 			controllerDriver->deviceHandle,
@@ -484,26 +441,26 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 		}
 
 		uint16_t pktSize = swap_endianness_16(endpoint_descriptor->wMaxPacketSize) & 0x7FF;
-		c.reportData = malloc(pktSize * 2);
-		memset(c.reportData, 0, pktSize * 2);
+		controller.reportData = calloc(1, pktSize * 2);
+		if (!controller.reportData) return -1;
 
 		controllerDriver->interruptTrb.savedEndpoint = controllerDriver->interruptTrb.endpoint; 
 		controllerDriver->interruptTrb.length = pktSize;
 		controllerDriver->interruptTrb.callback = (DWORD)interruptHandler;
-		controllerDriver->interruptTrb.buffer = c.reportData;
+		controllerDriver->interruptTrb.buffer = controller.reportData;
 
-		c.controllerDriver = controllerDriver;
+		controller.controllerDriver = controllerDriver;
 
 		uint8_t  userIndex = -1;
-		uint32_t context = 0x0000000010000005 + globalIndex;
-		XamUserBindDeviceCallback(0xa7553952 + globalIndex, context, 0, false, &userIndex);
-		c.userIndex = userIndex;
-		c.deviceContext = context;
-		connectedControllers[globalIndex] = c;
+		int index = controllerDriver->controllerIndex;
+		uint32_t context = 0x0000000010000005 + index;
+		XamUserBindDeviceCallback(0xa7553952 + index, context, 0, false, &userIndex);
+		controller.userIndex = userIndex;
+		controller.deviceContext = context;
 
 		DbgPrint("EINTIM: Registered virtual controller inside XAM with index: %d.\n", userIndex);
 
-		if (NeedsDualshock3Handshake(c.vendorId, c.productId)) {
+		if (NeedsDualshock3Handshake(controller.vendorId, controller.productId)) {
 			DbgPrint("EINTIM: Sending dualshock3 handshake!\r\n");
 			SendControlRequest(controllerDriver->deviceHandle,
 				&controllerDriver->controlTrb,
@@ -689,9 +646,87 @@ void HidFillButtonsReport(
 }
 
 unsigned int __stdcall MappingThreadProc(void* param);
+
+void ProteusPublishState(uint8_t interfaceNumber, const ButtonsReport& state) {
+	if (interfaceNumber < 2 || interfaceNumber > 5) return;
+	ProteusPendingSlot& slot = g_proteusPending[interfaceNumber - 2];
+	slot.state = state;
+	InterlockedExchange(&slot.connected, 1);
+	InterlockedExchange(&slot.hasState, 1);
+}
+
+void ProteusDisconnectController(uint8_t interfaceNumber) {
+	if (interfaceNumber < 2 || interfaceNumber > 5) return;
+	ProteusPendingSlot& slot = g_proteusPending[interfaceNumber - 2];
+	InterlockedExchange(&slot.connected, 0);
+	InterlockedExchange(&slot.hasState, 1);
+}
+
+static void PublishControllerState(Controller& controller, const ButtonsReport& state) {
+	LONG next = 1 - controller.publishedStateIndex;
+	controller.stateBuffers[next] = state;
+	InterlockedExchange(&controller.publishedStateIndex, next);
+}
+
+static void UnpublishProteusController() {
+	if (g_proteusControllerIndex < 0) return;
+	Controller& controller = connectedControllers[g_proteusControllerIndex];
+	ButtonsReport neutral = {};
+	PublishControllerState(controller, neutral);
+	XamUserBindDeviceCallback(0xa7553952 + g_proteusControllerIndex,
+		0x0000000010000005 + g_proteusControllerIndex, 0, true, 0);
+	memset(&controller, 0, sizeof(controller));
+	g_proteusControllerIndex = -1;
+	g_activeProteusInterface = -1;
+}
+
+static bool BindProteusController(uint8_t interfaceNumber, const ButtonsReport& state) {
+	int index = -1;
+	for (int i = 0; i < 4; ++i) {
+		if (!connectedControllers[i].controllerDriver) { index = i; break; }
+	}
+	if (index < 0) return false;
+	Controller& controller = connectedControllers[index];
+	memset(&controller, 0, sizeof(controller));
+	controller.kind = Controller::TRITON_PROTEUS;
+	controller.controllerDriver = (HidControllerExtension*)1;
+	controller.vendorId = 0x28DE;
+	controller.productId = 0x1304;
+	controller.deviceContext = 0x0000000010000005 + index;
+	PublishControllerState(controller, state);
+	uint8_t userIndex = 0xff;
+	XamUserBindDeviceCallback(0xa7553952 + index, controller.deviceContext, 0, false, &userIndex);
+	controller.userIndex = userIndex;
+	g_proteusControllerIndex = index;
+	g_activeProteusInterface = interfaceNumber;
+	DbgPrint("EINTIM: Proteus interface %d published as XAM controller %d\n", interfaceNumber, userIndex);
+	return true;
+}
+
+static void ProcessProteusEvents() {
+	if (g_activeProteusInterface >= 2) {
+		ProteusPendingSlot& active = g_proteusPending[g_activeProteusInterface - 2];
+		if (!active.connected) UnpublishProteusController();
+	}
+	if (g_activeProteusInterface < 0) {
+		for (int i = 0; i < 4; ++i) {
+			if (g_proteusPending[i].connected && g_proteusPending[i].hasState) {
+				if (BindProteusController((uint8_t)(i + 2), g_proteusPending[i].state)) break;
+			}
+		}
+	}
+	if (g_activeProteusInterface >= 2 && g_proteusControllerIndex >= 0) {
+		ProteusPendingSlot& active = g_proteusPending[g_activeProteusInterface - 2];
+		if (InterlockedExchange(&active.hasState, 0))
+			PublishControllerState(connectedControllers[g_proteusControllerIndex], active.state);
+	}
+}
+
 unsigned int __stdcall MappingManagerThreadProc(void* param){
 	// This thread monitors for controllers needing mapping and spawns mapping threads
 	while (true) {
+		ProcessProteusEvents();
+		ProteusMaintenance(GetTickCount());
 		for (int i = 0; i < 4; i++) {
 			// Check if controller exists, has reportInfo, but no mapping, and mapping not already in progress
 			if (connectedControllers[i].controllerDriver &&
@@ -985,13 +1020,13 @@ unsigned int __stdcall MappingThreadProc(void* param) {
 }
 
 int interruptHandler(DWORD deviceHandle, int32_t a2) {
-	HidControllerExtension* driverExtension = (HidControllerExtension*)((deviceHandle - 4));
-	Report* report = (Report*)driverExtension->interruptTrb.buffer;
+	HidControllerExtension* driverExtension = ExtensionFromInterruptTrb((void*)deviceHandle);
 
 	if (!driverExtension || !driverExtension->deviceHandle ||
 		!driverExtension->deviceHandle->driver ||
-		driverExtension->deviceHandle->driver->cleanupDone)
+		driverExtension->deviceHandle->driver->cleanupDone || driverExtension->removing)
 		return 0;
+	Report* report = (Report*)driverExtension->interruptTrb.buffer;
 
 	int index = -1;
 	for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
@@ -1000,6 +1035,8 @@ int interruptHandler(DWORD deviceHandle, int32_t a2) {
 			break;
 		}
 	}
+	if (index < 0)
+		return 0;
 
 	if (NeedsNintendoHandshake(connectedControllers[index].vendorId, connectedControllers[index].productId) && connectedControllers[index].nintendo_handshake_state != DONE) {
 		if (connectedControllers[index].nintendo_handshake_state == INITIAL) {
@@ -1160,6 +1197,8 @@ int interruptHandler(DWORD deviceHandle, int32_t a2) {
 
 
 int HidRemoveDeviceHook(deviceHandle* deviceHandle2) {
+	if (ProteusRemoveSlotInterface(deviceHandle2))
+		return 0;
 	bool found = false;
 	int index = 0;
 	for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
@@ -1187,6 +1226,7 @@ int HidRemoveDeviceHook(deviceHandle* deviceHandle2) {
 
 	if (!deviceHandle2->driver->cleanupDone) {
 		deviceHandle2->driver->cleanupDone = 1;
+		deviceHandle2->driver->removing = 1;
 		connectedControllers[index].controllerDriver = nullptr;
 
 		// Free HID report info for this controller slot
@@ -1195,16 +1235,18 @@ int HidRemoveDeviceHook(deviceHandle* deviceHandle2) {
 			connectedControllers[index].reportInfo = nullptr;
 		}
 		// Clear mapping data
+		void* reportDataToFree = connectedControllers[index].reportData;
 		connectedControllers[index].map = nullptr;
 		memset(&connectedControllers[index], 0, sizeof(Controller));
 		delete deviceHandle2->driver;
 		deviceHandle2->driver = nullptr;
-		free(connectedControllers[index].reportData);
+		free(reportDataToFree);
 		DbgPrint("EINTIM: Removed controller with handle %p\n", deviceHandle2);
 		XamUserBindDeviceCallback(0xa7553952 + index, 0x0000000010000005 + index, 0, true, 0);
 		DbgPrint("EINTIM: Removed virtual controller from XAM.\n");
 		return 0;
 	}
+	return 0;
 }
 
 int reportData = 0;
@@ -1212,6 +1254,8 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 	DbgPrint("EINTIM: HID add device %p\n", deviceHandle);
 	usb_device_descriptor* device_descriptor = UsbdGetDeviceDescriptor(deviceHandle);
 	usb_interface_descriptor* interface_descriptor = UsbdGetInterfaceDescriptor(deviceHandle);
+	if (!device_descriptor || !interface_descriptor)
+		return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
 
 	uint16_t vendorId = swap_endianness_16(device_descriptor->idVendor);
 	uint16_t productId = swap_endianness_16(device_descriptor->idProduct);
@@ -1222,6 +1266,10 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 	DbgPrint("EINTIM: IS USB1.0: %d\n", isOhci);
 	DbgPrint("EINTIM: USB device descriptor Pointer: %p\n", device_descriptor);
 	DbgPrint("EINTIM: HID device vendor id: %x, product id: %x\n", vendorId, productId);
+	if (ProteusIsSlot(vendorId, productId, interface_descriptor))
+		return ProteusAddSlotInterface(deviceHandle, interface_descriptor);
+	if (vendorId == 0x28DE && productId == 0x1304)
+		return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
 
 	if (interface_descriptor->bInterfaceClass == 0x03 &&
 		interface_descriptor->bInterfaceSubClass == 0 &&
@@ -1253,29 +1301,31 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 			DbgPrint("EINTIM: No free index!\n");
 			return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
 		}
-		globalIndex = index;
-
-		c = Controller();
-		memset(&c, 0, sizeof(Controller));
-		c.packetNumber = 0;
-		c.reportInfo = nullptr;   // will be filled in INIT_GET_REPORT_DESCRIPTOR
-		c.vendorId = vendorId;
-		c.productId = productId;
-		c.map = FindMapping(vendorId, productId);
-		c.nintendo_handshake_state = NINTENDO_HANDSHAKE_STATE::INITIAL;
+		Controller& controller = connectedControllers[index];
+		memset(&controller, 0, sizeof(Controller));
+		controller.kind = NeedsNintendoHandshake(vendorId, productId) ? Controller::SWITCH_PRO : Controller::GENERIC_HID;
+		controller.packetNumber = 0;
+		controller.reportInfo = nullptr;
+		controller.vendorId = vendorId;
+		controller.productId = productId;
+		controller.map = FindMapping(vendorId, productId);
+		controller.nintendo_handshake_state = NINTENDO_HANDSHAKE_STATE::INITIAL;
 
 		HidControllerExtension* controllerDriver = new HidControllerExtension();
-		c.deviceHandle = deviceHandle;
+		controller.deviceHandle = deviceHandle;
+		controller.controllerDriver = controllerDriver;
+		memset(controllerDriver, 0, sizeof(*controllerDriver));
 		controllerDriver->deviceType = 0;
 		deviceHandle->driver = controllerDriver;
 		controllerDriver->deviceHandle = deviceHandle;
 		controllerDriver->interfaceNumber = interface_descriptor->bInterfaceNumber;
+		controllerDriver->controllerIndex = index;
 		DbgPrint("EINTIM: Storing interface number: %d\n", controllerDriver->interfaceNumber);
 		controllerDriver->interruptTrb.flags = 1;
 
 		// Copy HID descriptor to global buffer for later use
-		memcpy(&hidDescriptorBuffer, hid_descriptor, sizeof(usb_hid_descriptor));
-		DbgPrint("EINTIM: Copied HID descriptor. wDescriptorLength: %d\n", hidDescriptorBuffer.wDescriptorLength);
+		memcpy(&controllerDriver->hidDescriptor, hid_descriptor, sizeof(usb_hid_descriptor));
+		DbgPrint("EINTIM: Copied HID descriptor. wDescriptorLength: %d\n", controllerDriver->hidDescriptor.wDescriptorLength);
 
 		UsbdAddDeviceComplete(deviceHandle, 0);
 
@@ -1286,7 +1336,8 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 		}
 
 		// Set device configuration (required for proper USB enumeration)
-		g_InitState = InitState::INIT_SET_CONFIGURATION;
+		controllerDriver->initState = INIT_SET_CONFIGURATION;
+		controllerDriver->controlBusy = 1;
 		DbgPrint("EINTIM: Sending SET_CONFIGURATION\n");
 		SendControlRequest(
 			controllerDriver->deviceHandle,
@@ -1360,6 +1411,7 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
 		capabilities->Vibration.wRightMotorSpeed = 0;
 		return ERROR_SUCCESS;
 	}
+	return status;
 }
 
 NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXINPUT_GAMEPAD pInputData, PBOOL unk) {
@@ -1376,13 +1428,21 @@ NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXI
 			if (connectedControllers[i].controllerDriver &&
 				connectedControllers[i].deviceContext == dwDeviceContext) {
 				c = &connectedControllers[i];
-				b = connectedControllers[i].currentState;
+				if (connectedControllers[i].kind == Controller::TRITON_PROTEUS) {
+					LONG first = connectedControllers[i].publishedStateIndex;
+					b = connectedControllers[i].stateBuffers[first];
+					LONG second = connectedControllers[i].publishedStateIndex;
+					if (first != second) b = connectedControllers[i].stateBuffers[second];
+				} else {
+					b = connectedControllers[i].currentState;
+				}
 				break;
 			}
 		}
 
 		if (!c)
 			return ERROR_INVALID_PARAMETER;
+		memset(pInputData, 0, sizeof(*pInputData));
 
 		if (b.xbox) {
 			DWORD now = GetTickCount();
