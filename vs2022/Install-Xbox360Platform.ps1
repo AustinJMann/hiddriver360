@@ -15,8 +15,8 @@
          Toolset.props / Toolset.targets) which forward to the XDK files
       3. Patches the copied Microsoft.Cpp.Xbox 360.targets so the XDK build tasks
          (CL/Link/ImageXex/DeployToHardDrive) are registered before VS2022's own
-         (MSBuild keeps the first registration; VS2022's CL task does not support
-         XDK parameters such as PREfast)
+         and run in a 32-bit task host. The XDK task assembly is 32-bit and cannot
+         be loaded directly by the 64-bit Visual Studio 2022 process.
       4. Restores build-phase properties (LinkCompiled/TargetExt/OutputType) and
          tool metadata defaults the VS2010-era Microsoft.Cpp.props used to supply
          (handled inside Platform.props)
@@ -85,21 +85,54 @@ try {
     Copy-Item -LiteralPath $src -Destination (Split-Path $dest -Parent) -Recurse -Force
     Log 'Copied XDK platform folder.'
 
-    # --- 2. Patch UsingTask order in the copied Microsoft.Cpp.Xbox 360.targets ---
+    # Keep the legacy task and its VC10 dependencies together so MSBuild's
+    # out-of-process task host can resolve them without relying on VS2010's GAC.
+    $legacyCppRoot = 'C:\Program Files (x86)\MSBuild\Microsoft.Cpp\v4.0'
+    $taskDependencies = @(
+        (Join-Path $env:XEDK 'bin\win32\Microsoft.Xna.Xbox360.Build.dll'),
+        (Join-Path $legacyCppRoot 'Microsoft.Build.CPPTasks.Common.dll'),
+        (Join-Path $legacyCppRoot 'Platforms\Win32\Microsoft.Build.CPPTasks.Win32.dll')
+    )
+    foreach ($dependency in $taskDependencies) {
+        if (-not (Test-Path -LiteralPath $dependency)) { throw "Required legacy build task not found: $dependency" }
+        Copy-Item -LiteralPath $dependency -Destination $dest -Force
+    }
+    Log 'Installed legacy XDK task assembly and VC10 dependencies.'
+
+    # --- 2. Patch UsingTask order/hosting in the copied Microsoft.Cpp.Xbox 360.targets ---
     $targetsFile = Join-Path $dest 'Microsoft.Cpp.Xbox 360.targets'
     $content = Get-Content -LiteralPath $targetsFile -Raw
-    if ($content -notmatch 'VS2022 bridge patch') {
-        $m = [regex]::Match($content, '(?s)<UsingTask TaskName="CL".*?<UsingTask TaskName="DeployToHardDrive".*?/>\s*')
-        if (-not $m.Success) { throw 'Could not locate UsingTask block in Microsoft.Cpp.Xbox 360.targets' }
-        $block = $m.Value
-        $content = $content.Remove($m.Index, $m.Length)
-        $marker = '<!-- VS2022 bridge patch: XDK task declarations moved before Microsoft.CppCommon.targets import so the XDK build tasks win registration -->'
-        $content = [regex]::Replace($content, '(?s)(<Project[^>]*>)', ('$1' + "`n" + $marker + "`n" + $block), 1)
-        Set-Content -LiteralPath $targetsFile -Value $content -NoNewline
-        Log 'Patched UsingTask order in Microsoft.Cpp.Xbox 360.targets.'
-    } else {
-        Log 'UsingTask patch already present.'
+    $content = [regex]::Replace($content, '\s*<!-- VS2022 bridge patch:.*?-->\s*', "`n")
+    $m = [regex]::Match($content, '(?s)<UsingTask TaskName="CL".*?<UsingTask TaskName="DeployToHardDrive".*?/>\s*')
+    if (-not $m.Success) { throw 'Could not locate UsingTask block in Microsoft.Cpp.Xbox 360.targets' }
+
+    # TaskHostFactory isolates the 32-bit XDK assembly from VS2022's 64-bit
+    # in-process MSBuild host. This remains compatible with command-line MSBuild.
+    $taskNamespace = 'Microsoft.Xna.Xbox360.Build.Tasks.'
+    $block = [regex]::Replace(
+        $m.Value,
+        '<UsingTask\s+TaskName="([^"]+)"\s+AssemblyFile="([^"]+)"\s*/>',
+        ('<UsingTask TaskName="' + $taskNamespace + '$1" AssemblyFile="$(MSBuildThisFileDirectory)Microsoft.Xna.Xbox360.Build.dll" TaskFactory="TaskHostFactory" Architecture="x86" Runtime="CLR4"/>')
+    )
+    $content = $content.Remove($m.Index, $m.Length)
+
+    # Use the fully qualified task names at call sites. VS2022 registers its own
+    # CL and Link tasks before some IDE builds are evaluated; explicit XDK type
+    # names avoid that alias collision.
+    foreach ($taskName in @('CL', 'Link', 'ImageXex', 'DeployToHardDrive')) {
+        $taskBlock = '(?s)<' + $taskName + '(?=\s+(?:Condition|Sources|InputFile))(?<body>.*?)</' + $taskName + '>'
+        $replacement = '<' + $taskNamespace + $taskName + '${body}</' + $taskNamespace + $taskName + '>'
+        $content = [regex]::Replace($content, $taskBlock, $replacement)
     }
+    $content = [regex]::Replace(
+        $content,
+        '(?s)<ImageXex(?=\s+InputFile)(?<body>.*?)/>',
+        ('<' + $taskNamespace + 'ImageXex${body}/>')
+    )
+    $marker = '<!-- VS2022 bridge patch: register XDK tasks first and host the 32-bit assembly out of process -->'
+    $content = [regex]::Replace($content, '(?s)(<Project[^>]*>)', ('$1' + "`n" + $marker + "`n" + $block), 1)
+    Set-Content -LiteralPath $targetsFile -Value $content -NoNewline
+    Log 'Patched XDK task order and 32-bit hosting in Microsoft.Cpp.Xbox 360.targets.'
 
     # --- 3. Install the bridge files shipped next to this script ---
     $bridgeFiles = @(
@@ -127,7 +160,10 @@ try {
         'Microsoft.Cpp.Xbox 360.targets',
         'Microsoft.Cpp.Xbox 360.default.props',
         'PlatformToolsets\2010-01\Microsoft.Cpp.Xbox 360.2010-01.props',
-        'PlatformToolsets\2010-01\Microsoft.Cpp.Xbox 360.2010-01.targets'
+        'PlatformToolsets\2010-01\Microsoft.Cpp.Xbox 360.2010-01.targets',
+        'Microsoft.Xna.Xbox360.Build.dll',
+        'Microsoft.Build.CPPTasks.Common.dll',
+        'Microsoft.Build.CPPTasks.Win32.dll'
     )
     $missing = $required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $dest $_)) }
     if ($missing) { throw ('Missing files after install: ' + ($missing -join '; ')) }
