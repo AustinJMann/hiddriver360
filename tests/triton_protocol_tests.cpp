@@ -2,8 +2,99 @@
 #include <string.h>
 
 #include "../hiddriver/triton_protocol.h"
+#include "../hiddriver/proteus_routing.h"
 
 using namespace TritonProtocol;
+
+struct SimSlot {
+	bool connected;
+	bool disconnectPending;
+	int controllerIndex;
+	uint32_t generation;
+	uint32_t state;
+};
+
+struct SimController {
+	bool occupied;
+	int slotIndex;
+	uint32_t generation;
+	uint32_t packetNumber;
+};
+
+struct RoutingSimulation {
+	SimSlot slots[ProteusRouting::kSlotCount];
+	SimController controllers[ProteusRouting::kControllerCount];
+	bool rejectBind[ProteusRouting::kSlotCount];
+
+	RoutingSimulation() { Reset(); }
+
+	void Reset() {
+		memset(this, 0, sizeof(*this));
+		for (int i = 0; i < ProteusRouting::kSlotCount; ++i) {
+			slots[i].controllerIndex = ProteusRouting::kUnboundController;
+			slots[i].generation = 1;
+			controllers[i].slotIndex = -1;
+		}
+	}
+
+	void Connect(int slotIndex, uint32_t state) {
+		slots[slotIndex].state = state;
+		slots[slotIndex].connected = true;
+	}
+
+	void Disconnect(int slotIndex) {
+		slots[slotIndex].connected = false;
+		slots[slotIndex].disconnectPending = true;
+	}
+
+	void Process() {
+		for (int slotIndex = 0; slotIndex < ProteusRouting::kSlotCount; ++slotIndex) {
+			SimSlot& slot = slots[slotIndex];
+			bool disconnectPending = slot.disconnectPending;
+			slot.disconnectPending = false;
+			if ((disconnectPending || !slot.connected) && slot.controllerIndex >= 0) {
+				SimController& controller = controllers[slot.controllerIndex];
+				controller.occupied = false;
+				controller.slotIndex = -1;
+				slot.controllerIndex = ProteusRouting::kUnboundController;
+				++slot.generation;
+			}
+		}
+		for (int slotIndex = 0; slotIndex < ProteusRouting::kSlotCount; ++slotIndex) {
+			SimSlot& slot = slots[slotIndex];
+			if (!slot.connected || slot.controllerIndex >= 0) continue;
+			int freeController = -1;
+			for (int i = 0; i < ProteusRouting::kControllerCount; ++i) {
+				if (!controllers[i].occupied) { freeController = i; break; }
+			}
+			if (freeController < 0) continue;
+			SimController& controller = controllers[freeController];
+			controller.occupied = true;
+			controller.slotIndex = slotIndex;
+			controller.generation = ++slot.generation;
+			slot.controllerIndex = freeController;
+			if (rejectBind[slotIndex]) {
+				controller.occupied = false;
+				controller.slotIndex = -1;
+				slot.controllerIndex = ProteusRouting::kUnboundController;
+				++slot.generation;
+			}
+		}
+	}
+
+	bool Read(int controllerIndex, uint32_t* state) {
+		SimController& controller = controllers[controllerIndex];
+		if (controller.slotIndex < 0) return false;
+		SimSlot& slot = slots[controller.slotIndex];
+		if (!ProteusRouting::AssociationMatches(slot.connected,
+			slot.controllerIndex, slot.generation, controller.occupied,
+			controller.slotIndex, controller.generation, controllerIndex))
+			return false;
+		*state = slot.state;
+		++controller.packetNumber;
+		return true;
+	}
+};
 
 static void Put16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void Put32(uint8_t* p, uint32_t v) {
@@ -86,10 +177,139 @@ static void TestStatusAndFeature() {
 	for (size_t i = 4; i < sizeof(report); ++i) assert(report[i] == 0);
 }
 
+static void TestRoutingConnectionOrders() {
+	int order[4];
+	int permutations = 0;
+	for (order[0] = 0; order[0] < 4; ++order[0])
+		for (order[1] = 0; order[1] < 4; ++order[1])
+			for (order[2] = 0; order[2] < 4; ++order[2])
+				for (order[3] = 0; order[3] < 4; ++order[3]) {
+					bool seen[4] = {};
+					bool unique = true;
+					for (int i = 0; i < 4; ++i) {
+						if (seen[order[i]]) unique = false;
+						seen[order[i]] = true;
+					}
+					if (!unique) continue;
+					++permutations;
+					RoutingSimulation simulation;
+					for (int i = 0; i < 4; ++i) {
+						simulation.Connect(order[i], (uint32_t)(100 + order[i]));
+						simulation.Process();
+					}
+					bool controllerSeen[4] = {};
+					for (int slot = 0; slot < 4; ++slot) {
+						int controller = simulation.slots[slot].controllerIndex;
+						assert(controller >= 0 && controller < 4);
+						assert(!controllerSeen[controller]);
+						controllerSeen[controller] = true;
+						uint32_t state = 0;
+						assert(simulation.Read(controller, &state));
+						assert(state == (uint32_t)(100 + slot));
+					}
+				}
+	assert(permutations == 24);
+}
+
+static void TestRoutingDisconnectRetryAndGeneration() {
+	RoutingSimulation simulation;
+	for (int i = 0; i < 4; ++i) simulation.controllers[i].occupied = true;
+	simulation.Connect(0, 11);
+	simulation.Process();
+	assert(simulation.slots[0].controllerIndex == -1);
+	simulation.controllers[2].occupied = false;
+	simulation.Process();
+	assert(simulation.slots[0].controllerIndex == 2);
+	uint32_t oldGeneration = simulation.controllers[2].generation;
+	simulation.Disconnect(0);
+	uint32_t state = 99;
+	assert(!simulation.Read(2, &state));
+	simulation.Process();
+	assert(!simulation.controllers[2].occupied);
+	simulation.Connect(0, 22);
+	simulation.Process();
+	int rebound = simulation.slots[0].controllerIndex;
+	assert(rebound >= 0);
+	assert(simulation.controllers[rebound].generation != oldGeneration);
+	assert(simulation.Read(rebound, &state) && state == 22);
+	assert(simulation.controllers[rebound].packetNumber == 1);
+	oldGeneration = simulation.controllers[rebound].generation;
+	simulation.Disconnect(0);
+	simulation.Connect(0, 33);
+	simulation.Process();
+	rebound = simulation.slots[0].controllerIndex;
+	assert(rebound >= 0);
+	assert(simulation.controllers[rebound].generation != oldGeneration);
+	assert(simulation.Read(rebound, &state) && state == 33);
+}
+
+static void TestRoutingFailuresAndIsolation() {
+	assert(ProteusRouting::IsValidXamBinding(0, 0));
+	assert(ProteusRouting::IsValidXamBinding(0, 3));
+	assert(!ProteusRouting::IsValidXamBinding(-1, 0));
+	assert(!ProteusRouting::IsValidXamBinding(0, 4));
+	RoutingSimulation simulation;
+	simulation.rejectBind[1] = true;
+	simulation.Connect(0, 10);
+	simulation.Connect(1, 20);
+	simulation.Process();
+	assert(simulation.slots[0].controllerIndex >= 0);
+	assert(simulation.slots[1].controllerIndex == -1);
+	simulation.rejectBind[1] = false;
+	simulation.Process();
+	int first = simulation.slots[0].controllerIndex;
+	int second = simulation.slots[1].controllerIndex;
+	assert(first != second);
+	simulation.Connect(0, 30);
+	uint32_t state = 0;
+	assert(simulation.Read(first, &state) && state == 30);
+	assert(simulation.Read(second, &state) && state == 20);
+	assert(simulation.controllers[first].packetNumber == 1);
+	assert(simulation.controllers[second].packetNumber == 1);
+}
+
+static void TestRoutingRemovalOrdersAndGuideDebounce() {
+	int order[4];
+	int permutations = 0;
+	for (order[0] = 0; order[0] < 4; ++order[0])
+		for (order[1] = 0; order[1] < 4; ++order[1])
+			for (order[2] = 0; order[2] < 4; ++order[2])
+				for (order[3] = 0; order[3] < 4; ++order[3]) {
+					bool seen[4] = {};
+					bool unique = true;
+					for (int i = 0; i < 4; ++i) {
+						if (seen[order[i]]) unique = false;
+						seen[order[i]] = true;
+					}
+					if (!unique) continue;
+					++permutations;
+					RoutingSimulation simulation;
+					for (int i = 0; i < 4; ++i) simulation.Connect(i, (uint32_t)i);
+					simulation.Process();
+					for (int i = 0; i < 4; ++i) {
+						simulation.Disconnect(order[i]);
+						simulation.Process();
+						assert(simulation.slots[order[i]].controllerIndex == -1);
+						for (int slot = 0; slot < 4; ++slot)
+							if (simulation.slots[slot].connected)
+								assert(simulation.slots[slot].controllerIndex >= 0);
+					}
+				}
+	assert(permutations == 24);
+	assert(ProteusRouting::GuidePressIsDue(0, 10, 1000));
+	assert(!ProteusRouting::GuidePressIsDue(100, 1099, 1000));
+	assert(ProteusRouting::GuidePressIsDue(100, 1100, 1000));
+	assert(ProteusRouting::GuidePressIsDue(0xfffffff0u, 0x000003e0u, 1000));
+}
+
 int main() {
 	TestEndianAndValidation();
 	TestStateIdsAndAxes();
 	TestButtonsAndTriggers();
 	TestStatusAndFeature();
+	TestRoutingConnectionOrders();
+	TestRoutingDisconnectRetryAndGeneration();
+	TestRoutingFailuresAndIsolation();
+	TestRoutingRemovalOrdersAndGuideDebounce();
 	return 0;
 }

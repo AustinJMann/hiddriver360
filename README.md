@@ -18,7 +18,7 @@ Experimental on-console HID driver focussing on providing third party, non xinpu
 - DualSense Edge
 - DualShock 3
 - Nintendo Switch Pro controller
-- Steam Controller 2026 (Triton) through a Valve Proteus (`28DE:1304`) wireless puck
+- Experimental support for up to four Steam Controller 2026 (Triton) controllers through one Valve Proteus (`28DE:1304`) wireless puck
 - Any USB HID compliant controller thanks to built in mapping assistant :) (this excludes modern xbox controllers like xbox one and xbox series because microsoft made them GIP only)
 
 ## How to use
@@ -29,7 +29,7 @@ Experimental on-console HID driver focussing on providing third party, non xinpu
 
 ### Triton / Proteus notes
 
-The controller must already be paired to the puck. The driver listens to Proteus bond-slot interfaces 2 through 5 but publishes at most one Triton from one Proteus puck as an Xbox 360 controller. Direct USB Triton, Bluetooth/BLE, Nereid, multiple simultaneous Triton controllers, advanced touch/IMU inputs, and rumble are not supported. The driver periodically disables the firmware keyboard/mouse fallback while a slot is active.
+Each controller must already be paired to a distinct puck slot. The driver publishes Proteus bond-slot interfaces 2 through 5 independently, subject to the Xbox 360 four-player limit shared with native Xbox 360 controllers and other HidDriver-supported USB controllers. If all player positions are occupied, a connected Triton remains waiting and is retried when capacity becomes available. Direct USB Triton, Bluetooth/BLE, Nereid, pairing management, multiple Proteus pucks, advanced touch/IMU inputs, and rumble are not supported. The driver periodically disables the firmware keyboard/mouse fallback while a slot is active.
 
 ## How to build
 1. Acquire the official Xbox 360 SDK using black magic

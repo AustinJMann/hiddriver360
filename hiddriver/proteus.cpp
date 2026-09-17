@@ -126,6 +126,20 @@ static void QueueLizardOff(ProteusSlot* slot) {
 		TritonProtocol::kFeatureReportSize, slot->featureReport);
 }
 
+static ProteusSlot* FindSlotByInterruptTrb(void* trb) {
+	for (int i = 0; i < kSlotCount; ++i)
+		if (g_slots[i].extension && &g_slots[i].extension->interruptTrb == trb)
+			return &g_slots[i];
+	return 0;
+}
+
+static ProteusSlot* FindSlotByControlTrb(void* trb) {
+	for (int i = 0; i < kSlotCount; ++i)
+		if (g_slots[i].extension && &g_slots[i].extension->controlTrb == trb)
+			return &g_slots[i];
+	return 0;
+}
+
 static void ParseConfigurationDescriptor() {
 	memset(g_slotEndpointDescriptors, 0, sizeof(g_slotEndpointDescriptors));
 	uint16_t totalLength = TritonProtocol::ReadLE16(g_configurationDescriptor + 2);
@@ -265,8 +279,7 @@ static void StartNextConfiguration() {
 }
 
 static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
-	HidControllerExtension* extension = ExtensionFromControlTrb((void*)trbAddress);
-	ProteusSlot* slot = FindSlotByHandle(extension ? extension->deviceHandle : 0);
+	ProteusSlot* slot = FindSlotByControlTrb((void*)trbAddress);
 	if (!slot) return status;
 	ControlPurpose purpose = slot->controlPurpose;
 	slot->controlPurpose = kControlNone;
@@ -358,8 +371,7 @@ static void QueueInput(ProteusSlot* slot) {
 }
 
 static int32_t InputComplete(DWORD trbAddress, int32_t status) {
-	HidControllerExtension* extension = ExtensionFromInterruptTrb((void*)trbAddress);
-	ProteusSlot* slot = FindSlotByHandle(extension ? extension->deviceHandle : 0);
+	ProteusSlot* slot = FindSlotByInterruptTrb((void*)trbAddress);
 	if (!slot || slot->removing) return status;
 	slot->inputPending = false;
 	if (!slot->loggedInputCompletion) {
@@ -448,7 +460,12 @@ int ProteusAddSlotInterface(deviceHandle* handle,
 	handle->driver = slot->extension;
 	UsbdAddDeviceComplete(handle, 0);
 	NTSTATUS result = UsbdOpenDefaultEndpoint(handle, (DWORD*)&slot->extension->controlTrb);
-	if (NT_ERROR(result)) return result;
+	if (NT_ERROR(result)) {
+		delete slot->extension;
+		handle->driver = 0;
+		memset(slot, 0, sizeof(*slot));
+		return result;
+	}
 	DbgPrint("EINTIM: Proteus slot interface %d initializing\n", slot->interfaceNumber);
 	slot->configurationPending = true;
 	StartNextConfiguration();
@@ -459,14 +476,25 @@ bool ProteusRemoveSlotInterface(deviceHandle* handle) {
 	ProteusSlot* slot = FindSlotByHandle(handle);
 	if (!slot) return false;
 	slot->removing = true;
-	if (slot->connected) ProteusDisconnectController(slot->interfaceNumber);
-	if (slot->listening) UsbdQueueCloseEndpoint(handle, &slot->extension->interruptTrb);
-	UsbdQueueCloseDefaultEndpoint(handle, (DWORD*)&slot->extension->controlTrb);
+	ProteusDisconnectController(slot->interfaceNumber);
+	if (slot->controlPurpose == kControlGetConfigurationDescriptor ||
+		slot->controlPurpose == kControlSetConfiguration)
+		g_configurationBusy = false;
+	NTSTATUS interruptClose = 0;
+	if (slot->listening)
+		interruptClose = UsbdQueueCloseEndpoint(handle, &slot->extension->interruptTrb);
+	NTSTATUS controlClose = UsbdQueueCloseDefaultEndpoint(handle,
+		(DWORD*)&slot->extension->controlTrb);
+	DbgPrint("EINTIM: Proteus interface %d close results interrupt %x control %x\n",
+		slot->interfaceNumber, interruptClose, controlClose);
+	handle->driver = 0;
+	// The XDK exposes no close-completion callback here. Complete device removal
+	// before releasing TRBs and buffers so the USB stack can quiesce queued work.
+	UsbdRemoveDeviceComplete(handle);
 	free(slot->inputBuffer);
 	slot->inputBuffer = 0;
 	delete slot->extension;
-	handle->driver = 0;
-	UsbdRemoveDeviceComplete(handle);
+	slot->extension = 0;
 	memset(slot, 0, sizeof(*slot));
 	bool anySlotsRemain = false;
 	for (int i = 0; i < kSlotCount; ++i)
@@ -477,7 +505,7 @@ bool ProteusRemoveSlotInterface(deviceHandle* handle) {
 		g_configurationDescriptorFetched = false;
 		memset(g_configurationDescriptor, 0, sizeof(g_configurationDescriptor));
 		memset(g_slotEndpointDescriptors, 0, sizeof(g_slotEndpointDescriptors));
-	}
+	} else StartNextConfiguration();
 	return true;
 }
 

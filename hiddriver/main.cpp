@@ -13,6 +13,7 @@
 #include "mapping.h"
 #include "driver_types.h"
 #include "proteus.h"
+#include "proteus_routing.h"
 
 Detour HidAddDeviceDetour;
 Detour HidRemoveDeviceDetour;
@@ -200,6 +201,7 @@ enum NINTENDO_HANDSHAKE_STATE {
 	DONE
 };
 struct Controller {
+	volatile LONG inUse;
 	enum Kind {
 		GENERIC_HID,
 		SWITCH_PRO,
@@ -212,13 +214,14 @@ struct Controller {
 	uint32_t deviceContext;
 	uint16_t vendorId;
 	uint16_t productId;
-	uint32_t packetNumber;
+	volatile LONG packetNumber;
+	DWORD guideLastPressTime;
 	HID_ReportInfo_t* reportInfo;
 	uint8_t reportId;
 	void* reportData;
 	const HidDeviceMapping* map;
-	ButtonsReport stateBuffers[2];
-	volatile LONG publishedStateIndex;
+	int8_t proteusSlotIndex;
+	uint32_t proteusGeneration;
 
 	// for nintendo specific handshake
 	NINTENDO_HANDSHAKE_STATE nintendo_handshake_state;
@@ -241,14 +244,46 @@ struct MappingState {
 Controller connectedControllers[4];
 MappingState g_mappingState;
 
-struct ProteusPendingSlot {
-	ButtonsReport state;
-	volatile LONG hasState;
+struct ProteusRoutingSlot {
+	ButtonsReport stateBuffers[2];
+	volatile LONG publishedStateIndex;
+	volatile LONG stateSequence;
 	volatile LONG connected;
+	volatile LONG disconnectPending;
+	volatile LONG controllerIndex;
+	volatile LONG generation;
 };
-ProteusPendingSlot g_proteusPending[4];
-volatile int g_activeProteusInterface = -1;
-volatile int g_proteusControllerIndex = -1;
+ProteusRoutingSlot g_proteusSlots[4];
+
+static void InitializeProteusRouting() {
+	memset(g_proteusSlots, 0, sizeof(g_proteusSlots));
+	for (int i = 0; i < 4; ++i) {
+		g_proteusSlots[i].controllerIndex = -1;
+		g_proteusSlots[i].generation = 1;
+	}
+}
+
+static int ReserveControllerRecord() {
+	for (int i = 0; i < 4; ++i) {
+		if (InterlockedCompareExchange(&connectedControllers[i].inUse, 1, 0) == 0) {
+			memset((uint8_t*)&connectedControllers[i] + sizeof(connectedControllers[i].inUse), 0,
+				sizeof(Controller) - sizeof(connectedControllers[i].inUse));
+			connectedControllers[i].proteusSlotIndex = -1;
+			connectedControllers[i].userIndex = 0xff;
+			return i;
+		}
+	}
+	return -1;
+}
+
+static void ReleaseControllerRecord(int controllerIndex) {
+	if (controllerIndex < 0 || controllerIndex >= 4) return;
+	Controller& controller = connectedControllers[controllerIndex];
+	memset((uint8_t*)&controller + sizeof(controller.inUse), 0,
+		sizeof(Controller) - sizeof(controller.inUse));
+	MemoryBarrier();
+	InterlockedExchange(&controller.inUse, 0);
+}
 
 int interruptHandler(DWORD deviceHandle, int32_t a2);
 
@@ -349,6 +384,8 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 		controllerDriver->controllerIndex >= 4)
 		return status;
 	Controller& controller = connectedControllers[controllerDriver->controllerIndex];
+	if (!controller.inUse || controller.controllerDriver != controllerDriver)
+		return status;
 	controllerDriver->controlBusy = 0;
 
 	if (status != 0) {
@@ -646,91 +683,106 @@ void HidFillButtonsReport(
 }
 
 unsigned int __stdcall MappingThreadProc(void* param);
-static void PublishControllerState(Controller& controller, const ButtonsReport& state);
+
+static bool SnapshotProteusState(const ProteusRoutingSlot& slot, ButtonsReport* state) {
+	for (int attempt = 0; attempt < 4; ++attempt) {
+		LONG before = slot.stateSequence;
+		if (before & 1) continue;
+		MemoryBarrier();
+		LONG index = slot.publishedStateIndex;
+		*state = slot.stateBuffers[index];
+		MemoryBarrier();
+		LONG after = slot.stateSequence;
+		if (before == after && !(after & 1)) return true;
+	}
+	memset(state, 0, sizeof(*state));
+	return false;
+}
 
 void ProteusPublishState(uint8_t interfaceNumber, const ButtonsReport& state) {
 	if (interfaceNumber < 2 || interfaceNumber > 5) return;
-	ProteusPendingSlot& slot = g_proteusPending[interfaceNumber - 2];
-	slot.state = state;
+	ProteusRoutingSlot& slot = g_proteusSlots[interfaceNumber - 2];
+	InterlockedIncrement(&slot.stateSequence);
+	LONG next = 1 - slot.publishedStateIndex;
+	slot.stateBuffers[next] = state;
+	MemoryBarrier();
+	InterlockedExchange(&slot.publishedStateIndex, next);
+	InterlockedIncrement(&slot.stateSequence);
 	InterlockedExchange(&slot.connected, 1);
-	InterlockedExchange(&slot.hasState, 1);
-
-	// Once XAM publication is established, deliver every USB report directly to
-	// the lock-free state buffers. Routing gameplay through the 100 ms
-	// maintenance tick loses short presses and adds perceptible latency.
-	int controllerIndex = g_proteusControllerIndex;
-	if (g_activeProteusInterface == interfaceNumber &&
-		controllerIndex >= 0 && controllerIndex < 4 &&
-		connectedControllers[controllerIndex].kind == Controller::TRITON_PROTEUS) {
-		PublishControllerState(connectedControllers[controllerIndex], state);
-	}
 }
 
 void ProteusDisconnectController(uint8_t interfaceNumber) {
 	if (interfaceNumber < 2 || interfaceNumber > 5) return;
-	ProteusPendingSlot& slot = g_proteusPending[interfaceNumber - 2];
+	ProteusRoutingSlot& slot = g_proteusSlots[interfaceNumber - 2];
 	InterlockedExchange(&slot.connected, 0);
-	InterlockedExchange(&slot.hasState, 1);
+	InterlockedExchange(&slot.disconnectPending, 1);
 }
 
-static void PublishControllerState(Controller& controller, const ButtonsReport& state) {
-	LONG next = 1 - controller.publishedStateIndex;
-	controller.stateBuffers[next] = state;
-	InterlockedExchange(&controller.publishedStateIndex, next);
-}
-
-static void UnpublishProteusController() {
-	if (g_proteusControllerIndex < 0) return;
-	Controller& controller = connectedControllers[g_proteusControllerIndex];
-	ButtonsReport neutral = {};
-	PublishControllerState(controller, neutral);
-	XamUserBindDeviceCallback(0xa7553952 + g_proteusControllerIndex,
-		0x0000000010000005 + g_proteusControllerIndex, 0, true, 0);
-	memset(&controller, 0, sizeof(controller));
-	g_proteusControllerIndex = -1;
-	g_activeProteusInterface = -1;
-}
-
-static bool BindProteusController(uint8_t interfaceNumber, const ButtonsReport& state) {
-	int index = -1;
-	for (int i = 0; i < 4; ++i) {
-		if (!connectedControllers[i].controllerDriver) { index = i; break; }
+static void UnbindProteusController(int slotIndex) {
+	ProteusRoutingSlot& slot = g_proteusSlots[slotIndex];
+	int controllerIndex = slot.controllerIndex;
+	if (controllerIndex < 0 || controllerIndex >= 4) return;
+	Controller& controller = connectedControllers[controllerIndex];
+	if (!controller.inUse || controller.kind != Controller::TRITON_PROTEUS ||
+		controller.proteusSlotIndex != slotIndex ||
+		controller.proteusGeneration != (uint32_t)slot.generation) {
+		InterlockedExchange(&slot.controllerIndex, -1);
+		InterlockedIncrement(&slot.generation);
+		return;
 	}
+	XamUserBindDeviceCallback(0xa7553952 + controllerIndex,
+		0x0000000010000005 + controllerIndex, 0, true, 0);
+	InterlockedExchange(&slot.controllerIndex, -1);
+	InterlockedIncrement(&slot.generation);
+	DbgPrint("EINTIM: Proteus interface %d unbound from HidDriver index %d, XAM user %d\n",
+		slotIndex + 2, controllerIndex, controller.userIndex);
+	ReleaseControllerRecord(controllerIndex);
+}
+
+static bool BindProteusController(int slotIndex) {
+	ProteusRoutingSlot& slot = g_proteusSlots[slotIndex];
+	if (!slot.connected || slot.controllerIndex >= 0) return false;
+	int index = ReserveControllerRecord();
 	if (index < 0) return false;
 	Controller& controller = connectedControllers[index];
-	memset(&controller, 0, sizeof(controller));
 	controller.kind = Controller::TRITON_PROTEUS;
-	controller.controllerDriver = (HidControllerExtension*)1;
 	controller.vendorId = 0x28DE;
 	controller.productId = 0x1304;
 	controller.deviceContext = 0x0000000010000005 + index;
-	PublishControllerState(controller, state);
+	controller.proteusSlotIndex = (int8_t)slotIndex;
+	controller.proteusGeneration = (uint32_t)InterlockedIncrement(&slot.generation);
+	InterlockedExchange(&slot.controllerIndex, index);
+	MemoryBarrier();
 	uint8_t userIndex = 0xff;
-	XamUserBindDeviceCallback(0xa7553952 + index, controller.deviceContext, 0, false, &userIndex);
+	int bindResult = XamUserBindDeviceCallback(0xa7553952 + index,
+		controller.deviceContext, 0, false, &userIndex);
+	if (!ProteusRouting::IsValidXamBinding(bindResult, userIndex)) {
+		DbgPrint("EINTIM: Proteus interface %d bind failed for HidDriver index %d: result %x user %d\n",
+			slotIndex + 2, index, bindResult, userIndex);
+		if (bindResult == 0)
+			XamUserBindDeviceCallback(0xa7553952 + index,
+				controller.deviceContext, 0, true, 0);
+		InterlockedExchange(&slot.controllerIndex, -1);
+		InterlockedIncrement(&slot.generation);
+		ReleaseControllerRecord(index);
+		return false;
+	}
 	controller.userIndex = userIndex;
-	g_proteusControllerIndex = index;
-	g_activeProteusInterface = interfaceNumber;
-	DbgPrint("EINTIM: Proteus interface %d published as XAM controller %d\n", interfaceNumber, userIndex);
+	DbgPrint("EINTIM: Proteus interface %d bound to HidDriver index %d, XAM user %d\n",
+		slotIndex + 2, index, userIndex);
 	return true;
 }
 
 static void ProcessProteusEvents() {
-	if (g_activeProteusInterface >= 2) {
-		ProteusPendingSlot& active = g_proteusPending[g_activeProteusInterface - 2];
-		if (!active.connected) UnpublishProteusController();
+	for (int i = 0; i < 4; ++i) {
+		LONG disconnectPending = InterlockedExchange(&g_proteusSlots[i].disconnectPending, 0);
+		if ((disconnectPending || !g_proteusSlots[i].connected) &&
+			g_proteusSlots[i].controllerIndex >= 0)
+			UnbindProteusController(i);
 	}
-	if (g_activeProteusInterface < 0) {
-		for (int i = 0; i < 4; ++i) {
-			if (g_proteusPending[i].connected && g_proteusPending[i].hasState) {
-				if (BindProteusController((uint8_t)(i + 2), g_proteusPending[i].state)) break;
-			}
-		}
-	}
-	if (g_activeProteusInterface >= 2 && g_proteusControllerIndex >= 0) {
-		ProteusPendingSlot& active = g_proteusPending[g_activeProteusInterface - 2];
-		if (InterlockedExchange(&active.hasState, 0))
-			PublishControllerState(connectedControllers[g_proteusControllerIndex], active.state);
-	}
+	for (int i = 0; i < 4; ++i)
+		if (g_proteusSlots[i].connected && g_proteusSlots[i].controllerIndex < 0)
+			BindProteusController(i);
 }
 
 unsigned int __stdcall MappingManagerThreadProc(void* param){
@@ -740,7 +792,7 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 		ProteusMaintenance(GetTickCount());
 		for (int i = 0; i < 4; i++) {
 			// Check if controller exists, has reportInfo, but no mapping, and mapping not already in progress
-			if (connectedControllers[i].controllerDriver &&
+			if (connectedControllers[i].inUse &&
 				connectedControllers[i].reportInfo &&
 				!connectedControllers[i].map &&
 				!g_mappingState.active) {
@@ -1239,7 +1291,6 @@ int HidRemoveDeviceHook(deviceHandle* deviceHandle2) {
 		deviceHandle2->driver->cleanupDone = 1;
 		deviceHandle2->driver->removing = 1;
 		connectedControllers[index].controllerDriver = nullptr;
-
 		// Free HID report info for this controller slot
 		if (connectedControllers[index].reportInfo) {
 			USB_FreeReportInfo(connectedControllers[index].reportInfo);
@@ -1248,13 +1299,13 @@ int HidRemoveDeviceHook(deviceHandle* deviceHandle2) {
 		// Clear mapping data
 		void* reportDataToFree = connectedControllers[index].reportData;
 		connectedControllers[index].map = nullptr;
-		memset(&connectedControllers[index], 0, sizeof(Controller));
 		delete deviceHandle2->driver;
 		deviceHandle2->driver = nullptr;
 		free(reportDataToFree);
 		DbgPrint("EINTIM: Removed controller with handle %p\n", deviceHandle2);
 		XamUserBindDeviceCallback(0xa7553952 + index, 0x0000000010000005 + index, 0, true, 0);
 		DbgPrint("EINTIM: Removed virtual controller from XAM.\n");
+		ReleaseControllerRecord(index);
 		return 0;
 	}
 	return 0;
@@ -1299,21 +1350,14 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 			return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
 		}
 		
-		int index = -1;
-		for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
-			if (!connectedControllers[i].controllerDriver) {
-				DbgPrint("Assigning controller to index %d\n", i);
-				index = i;
-				break;
-			}
-		}
+		int index = ReserveControllerRecord();
+		if (index >= 0) DbgPrint("Assigning controller to index %d\n", index);
 
 		if (index == -1) {
 			DbgPrint("EINTIM: No free index!\n");
 			return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
 		}
 		Controller& controller = connectedControllers[index];
-		memset(&controller, 0, sizeof(Controller));
 		controller.kind = NeedsNintendoHandshake(vendorId, productId) ? Controller::SWITCH_PRO : Controller::GENERIC_HID;
 		controller.packetNumber = 0;
 		controller.reportInfo = nullptr;
@@ -1323,6 +1367,10 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 		controller.nintendo_handshake_state = NINTENDO_HANDSHAKE_STATE::INITIAL;
 
 		HidControllerExtension* controllerDriver = new HidControllerExtension();
+		if (!controllerDriver) {
+			ReleaseControllerRecord(index);
+			return -1;
+		}
 		controller.deviceHandle = deviceHandle;
 		controller.controllerDriver = controllerDriver;
 		memset(controllerDriver, 0, sizeof(*controllerDriver));
@@ -1343,6 +1391,9 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 		NTSTATUS status = UsbdOpenDefaultEndpoint(deviceHandle, (DWORD*)&controllerDriver->controlTrb);
 		if (NT_ERROR(status)) {
 			DbgPrint("EINTIM: Failed to open control endpoint %x!\n", status);
+			delete controllerDriver;
+			deviceHandle->driver = 0;
+			ReleaseControllerRecord(index);
 			return status;
 		}
 
@@ -1375,7 +1426,7 @@ DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_STATE* pInputState, B
 	if (status == ERROR_DEVICE_NOT_CONNECTED) {
 		Controller* c = nullptr;
 		for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
-			if (connectedControllers[i].controllerDriver &&
+			if (connectedControllers[i].inUse &&
 				connectedControllers[i].userIndex == user) {
 				c = &connectedControllers[i];
 				break;
@@ -1401,7 +1452,7 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
 	if (status == ERROR_DEVICE_NOT_CONNECTED) {
 		Controller* c = nullptr;
 		for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
-			if (connectedControllers[i].controllerDriver &&
+			if (connectedControllers[i].inUse &&
 				connectedControllers[i].userIndex == user) {
 				c = &connectedControllers[i];
 				break;
@@ -1430,23 +1481,33 @@ NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXI
 		if (!pInputData)
 			return ERROR_INVALID_PARAMETER;
 
-		static DWORD lastPressTime = 0;
 		static const DWORD cooldownDuration = 1000;
 
-		ButtonsReport b;
+		ButtonsReport b = {};
 		Controller* c = nullptr;
+		int controllerIndex = -1;
 		for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
-			if (connectedControllers[i].controllerDriver &&
+			if (connectedControllers[i].inUse &&
 				connectedControllers[i].deviceContext == dwDeviceContext) {
 				c = &connectedControllers[i];
 				if (connectedControllers[i].kind == Controller::TRITON_PROTEUS) {
-					LONG first = connectedControllers[i].publishedStateIndex;
-					b = connectedControllers[i].stateBuffers[first];
-					LONG second = connectedControllers[i].publishedStateIndex;
-					if (first != second) b = connectedControllers[i].stateBuffers[second];
+					int slotIndex = connectedControllers[i].proteusSlotIndex;
+					if (ProteusRouting::IsValidSlotIndex(slotIndex)) {
+						ProteusRoutingSlot& slot = g_proteusSlots[slotIndex];
+						uint32_t generation = connectedControllers[i].proteusGeneration;
+						if (ProteusRouting::AssociationMatches(slot.connected != 0,
+							slot.controllerIndex, (uint32_t)slot.generation,
+							connectedControllers[i].inUse != 0, slotIndex, generation, i)) {
+							SnapshotProteusState(slot, &b);
+							if (!slot.connected || slot.controllerIndex != i ||
+								(uint32_t)slot.generation != generation)
+								memset(&b, 0, sizeof(b));
+						}
+					}
 				} else {
 					b = connectedControllers[i].currentState;
 				}
+				controllerIndex = i;
 				break;
 			}
 		}
@@ -1457,8 +1518,8 @@ NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXI
 
 		if (b.xbox) {
 			DWORD now = GetTickCount();
-			if (now - lastPressTime >= cooldownDuration) {
-				lastPressTime = now;
+			if (ProteusRouting::GuidePressIsDue(c->guideLastPressTime, now, cooldownDuration)) {
+				c->guideLastPressTime = now;
 				XamInputSendXenonButtonPress(c->userIndex);
 			}
 		}
@@ -1523,7 +1584,7 @@ NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXI
 		pInputData->bRightTrigger = b.ry ? b.ry : (b.r2 ? 255 : 0);
 
 		if (pdwPacketNumber)
-			*pdwPacketNumber = ++c->packetNumber;
+			*pdwPacketNumber = (DWORD)InterlockedIncrement(&connectedControllers[controllerIndex].packetNumber);
 		if (unk)
 			*unk = FALSE;
 
@@ -1635,6 +1696,7 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		DbgPrint("EINTIM: HELLO from xbox 360 HID controller driver version 0.6 beta\n");
 		if (!initFunctionPointers())
 			return FALSE;
+		InitializeProteusRouting();
 
 		DbgPrint("EINTIM: Loading mappings!\r\n");
 		if (!LoadMappingsFromFile("HDD:\\hiddriver.json")) {

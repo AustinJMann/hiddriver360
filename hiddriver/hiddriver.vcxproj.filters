@@ -17,6 +17,7 @@
     <ClInclude Include="mapping.h" />
     <ClInclude Include="driver_types.h" />
     <ClInclude Include="proteus.h" />
+    <ClInclude Include="proteus_routing.h" />
     <ClInclude Include="triton_protocol.h" />
     <ClInclude Include="usb.h" />
   </ItemGroup>
