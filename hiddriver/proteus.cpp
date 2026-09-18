@@ -29,6 +29,8 @@ namespace {
 static const int kSlotCount = 4;
 static const uint32_t kHeartbeatIntervalMs = 2000;
 static const uint32_t kHeartbeatRetryMs = 250;
+static const uint32_t kInputRetryMs = 50;
+static const uint32_t kRemovalGraceMs = 1000;
 static const uint16_t kMaxHidPacketSize = 64;
 static const uint16_t kConfigurationDescriptorBufferSize = 512;
 
@@ -48,13 +50,15 @@ struct ProteusSlot {
 	uint8_t featureReport[TritonProtocol::kFeatureReportSize];
 	usb_endpoint_descriptor endpointDescriptor;
 	uint32_t heartbeatDeadline;
+	uint32_t inputRetryDeadline;
 	uint32_t retryDelay;
+	uint32_t inputErrorCount;
 	uint8_t featureFailureCount;
 	bool listening;
-	bool inputPending;
+	volatile bool inputPending;
 	bool connected;
 	bool heartbeatEnabled;
-	bool controlBusy;
+	volatile bool controlBusy;
 	ControlPurpose controlPurpose;
 	bool configurationPending;
 	bool loggedFirstReport;
@@ -63,13 +67,19 @@ struct ProteusSlot {
 	bool loggedControlQueueResult;
 	bool loggedInputCompletion;
 	bool loggedLizardSuccess;
-	bool removing;
+	volatile bool removing;
+	volatile bool removeCompleteCalled;
+	volatile bool cleanupReady;
+	bool loggedRemovalWait;
+	uint32_t cleanupDeadline;
 };
 
 static ProteusSlot g_slots[kSlotCount];
 static bool g_configurationBusy;
 static bool g_configured;
 static bool g_configurationDescriptorFetched;
+static volatile LONG g_controlOwnerSlot = -1;
+static int g_nextHeartbeatSlot;
 static uint8_t g_configurationDescriptor[kConfigurationDescriptorBufferSize];
 static usb_endpoint_descriptor g_slotEndpointDescriptors[kSlotCount];
 
@@ -95,10 +105,51 @@ static int32_t InputComplete(DWORD trbAddress, int32_t status);
 static int32_t ControlComplete(DWORD trbAddress, int32_t status);
 static void StartNextConfiguration();
 
-static void QueueControl(ProteusSlot* slot, ControlPurpose purpose,
+static void UpdateRemovalReady(ProteusSlot* slot) {
+	if (!slot || !slot->removing || !slot->removeCompleteCalled)
+		return;
+	if (!slot->cleanupReady) {
+		slot->cleanupDeadline = GetTickCount() + kRemovalGraceMs;
+		MemoryBarrier();
+		slot->cleanupReady = true;
+	}
+}
+
+static void FinalizeRemoval(ProteusSlot* slot) {
+	if (!slot || !slot->cleanupReady)
+		return;
+	uint8_t interfaceNumber = slot->interfaceNumber;
+	// The Xbox USB stack may retain the closed TRB after delivering its cancel
+	// callback. Remove live lookup keys, but quarantine the small allocation for
+	// the remainder of this driver session instead of risking a use-after-free.
+	memset(slot, 0, sizeof(*slot));
+	MemoryBarrier();
+	DbgPrint("EINTIM: Proteus interface %d removal complete; USB storage quarantined\n",
+		interfaceNumber);
+	bool anySlotsRemain = false;
+	for (int i = 0; i < kSlotCount; ++i)
+		if (g_slots[i].handle) anySlotsRemain = true;
+	if (!anySlotsRemain) {
+		g_configurationBusy = false;
+		g_configured = false;
+		g_configurationDescriptorFetched = false;
+		InterlockedExchange(&g_controlOwnerSlot, -1);
+		g_nextHeartbeatSlot = 0;
+		memset(g_configurationDescriptor, 0, sizeof(g_configurationDescriptor));
+		memset(g_slotEndpointDescriptors, 0, sizeof(g_slotEndpointDescriptors));
+	}
+}
+
+static bool QueueControl(ProteusSlot* slot, ControlPurpose purpose,
 	uint8_t requestType, uint8_t request, uint16_t value,
 	uint16_t index, uint16_t length, void* data) {
-	if (!slot || slot->removing || slot->controlBusy) return;
+	if (!slot || slot->removing || slot->controlBusy) return false;
+	int slotIndex = (int)(slot - g_slots);
+	if (slotIndex < 0 || slotIndex >= kSlotCount) return false;
+	// All interface handles share the puck's physical endpoint zero. Allow only
+	// one configuration/feature transfer across the entire puck at a time.
+	if (InterlockedCompareExchange(&g_controlOwnerSlot, slotIndex, -1) != -1)
+		return false;
 	UsbControlTrb* control = &slot->extension->controlTrb;
 	control->packet.bmRequestType = requestType;
 	control->packet.bRequest = request;
@@ -118,11 +169,12 @@ static void QueueControl(ProteusSlot* slot, ControlPurpose purpose,
 		DbgPrint("EINTIM: Proteus slot %d control transfer queued token %x request %02x value %04x\n",
 			slot->interfaceNumber, queueToken, request, value);
 	}
+	return true;
 }
 
-static void QueueLizardOff(ProteusSlot* slot) {
+static bool QueueLizardOff(ProteusSlot* slot) {
 	TritonProtocol::BuildLizardOffFeatureReport(slot->featureReport);
-	QueueControl(slot, kControlLizardOff, 0x21, 0x09, 0x0301, slot->interfaceNumber,
+	return QueueControl(slot, kControlLizardOff, 0x21, 0x09, 0x0301, slot->interfaceNumber,
 		TritonProtocol::kFeatureReportSize, slot->featureReport);
 }
 
@@ -236,7 +288,9 @@ static bool StartListening(ProteusSlot* slot) {
 	DbgPrint("EINTIM: Proteus slot interface %d listening endpoint %02x size %d interval %d\n",
 		slot->interfaceNumber, endpoint->bEndpointAddress, packetSize, endpoint->bInterval);
 	QueueInput(slot);
-	slot->heartbeatEnabled = true;
+	// Do not probe empty bond slots on the puck-wide control endpoint. Wireless
+	// activity below enables raw mode for the specific slot that needs it.
+	slot->heartbeatEnabled = false;
 	slot->heartbeatDeadline = 0;
 	return true;
 }
@@ -247,11 +301,11 @@ static void StartNextConfiguration() {
 		for (int i = 0; i < kSlotCount; ++i) {
 			ProteusSlot* slot = &g_slots[i];
 			if (slot->handle && slot->configurationPending && !slot->removing) {
-				g_configurationBusy = true;
 				memset(g_configurationDescriptor, 0, sizeof(g_configurationDescriptor));
-				QueueControl(slot, kControlGetConfigurationDescriptor,
+				if (QueueControl(slot, kControlGetConfigurationDescriptor,
 					0x80, 0x06, 0x0200, 0, kConfigurationDescriptorBufferSize,
-					g_configurationDescriptor);
+					g_configurationDescriptor))
+					g_configurationBusy = true;
 				return;
 			}
 		}
@@ -270,9 +324,10 @@ static void StartNextConfiguration() {
 	for (int i = 0; i < kSlotCount; ++i) {
 		ProteusSlot* slot = &g_slots[i];
 		if (slot->handle && slot->configurationPending && !slot->removing) {
-			slot->configurationPending = false;
-			g_configurationBusy = true;
-			QueueControl(slot, kControlSetConfiguration, 0x00, 0x09, 1, 0, 0, 0);
+			if (QueueControl(slot, kControlSetConfiguration, 0x00, 0x09, 1, 0, 0, 0)) {
+				slot->configurationPending = false;
+				g_configurationBusy = true;
+			}
 			return;
 		}
 	}
@@ -281,10 +336,13 @@ static void StartNextConfiguration() {
 static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 	ProteusSlot* slot = FindSlotByControlTrb((void*)trbAddress);
 	if (!slot) return status;
+	int slotIndex = (int)(slot - g_slots);
+	InterlockedCompareExchange(&g_controlOwnerSlot, -1, slotIndex);
 	ControlPurpose purpose = slot->controlPurpose;
 	slot->controlPurpose = kControlNone;
 	if (slot->removing) {
 		slot->controlBusy = false;
+		UpdateRemovalReady(slot);
 		return status;
 	}
 	if (purpose == kControlGetConfigurationDescriptor) {
@@ -323,7 +381,7 @@ static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 			DbgPrint("EINTIM: Proteus slot %d lizard-off request completed successfully\n",
 				slot->interfaceNumber);
 		}
-		if (!slot->inputPending) {
+		if (!slot->inputPending && slot->inputRetryDeadline == 0) {
 			DbgPrint("EINTIM: Proteus slot %d arming input after raw-mode success\n",
 				slot->interfaceNumber);
 			QueueInput(slot);
@@ -341,6 +399,7 @@ static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 			DbgPrint("EINTIM: Proteus slot %d empty; pausing lizard probes until wireless activity\n",
 				slot->interfaceNumber);
 			slot->controlBusy = false;
+			StartNextConfiguration();
 			return status;
 		}
 		slot->heartbeatDeadline = GetTickCount() + slot->retryDelay;
@@ -349,6 +408,7 @@ static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 	}
 	MemoryBarrier();
 	slot->controlBusy = false;
+	StartNextConfiguration();
 	return status;
 }
 
@@ -363,6 +423,7 @@ static void QueueInput(ProteusSlot* slot) {
 	trb->savedEndpoint = trb->endpoint;
 	int queueToken = UsbdQueueAsyncTransfer(slot->handle, trb);
 	slot->inputPending = true;
+	slot->inputRetryDeadline = 0;
 	if (!slot->loggedInputQueueResult) {
 		slot->loggedInputQueueResult = true;
 		DbgPrint("EINTIM: Proteus slot %d input transfer queued token %x endpoint %02x\n",
@@ -372,18 +433,33 @@ static void QueueInput(ProteusSlot* slot) {
 
 static int32_t InputComplete(DWORD trbAddress, int32_t status) {
 	ProteusSlot* slot = FindSlotByInterruptTrb((void*)trbAddress);
-	if (!slot || slot->removing) return status;
+	if (!slot) return status;
 	slot->inputPending = false;
+	if (slot->removing) {
+		UpdateRemovalReady(slot);
+		return status;
+	}
 	if (!slot->loggedInputCompletion) {
 		slot->loggedInputCompletion = true;
 		DbgPrint("EINTIM: Proteus slot %d first input completion status %x\n",
 			slot->interfaceNumber, status);
 	}
 	if (status != 0) {
+		++slot->inputErrorCount;
+		if (slot->inputErrorCount <= 3 ||
+			(slot->inputErrorCount & (slot->inputErrorCount - 1)) == 0)
+			DbgPrint("EINTIM: Proteus slot %d input error %x count %d; retrying with backoff\n",
+				slot->interfaceNumber, status, slot->inputErrorCount);
 		if (slot->connected) ProteusDisconnectController(slot->interfaceNumber);
 		slot->connected = false;
-		QueueInput(slot);
+		slot->inputRetryDeadline = GetTickCount() + kInputRetryMs;
 		return status;
+	}
+	// A successful interrupt report means this interface is active even if the
+	// report ID is newer than the decoder. Prioritize its lizard-off request.
+	if (!slot->heartbeatEnabled) {
+		slot->heartbeatEnabled = true;
+		slot->heartbeatDeadline = 0;
 	}
 
 	TritonProtocol::InputState input;
@@ -475,46 +551,62 @@ int ProteusAddSlotInterface(deviceHandle* handle,
 bool ProteusRemoveSlotInterface(deviceHandle* handle) {
 	ProteusSlot* slot = FindSlotByHandle(handle);
 	if (!slot) return false;
+	if (slot->removing) return true;
 	slot->removing = true;
+	DbgPrint("EINTIM: Proteus interface %d removal begin input %d control %d\n",
+		slot->interfaceNumber, slot->inputPending, slot->controlBusy);
 	ProteusDisconnectController(slot->interfaceNumber);
 	if (slot->controlPurpose == kControlGetConfigurationDescriptor ||
 		slot->controlPurpose == kControlSetConfiguration)
 		g_configurationBusy = false;
-	NTSTATUS interruptClose = 0;
-	if (slot->listening)
-		interruptClose = UsbdQueueCloseEndpoint(handle, &slot->extension->interruptTrb);
-	NTSTATUS controlClose = UsbdQueueCloseDefaultEndpoint(handle,
-		(DWORD*)&slot->extension->controlTrb);
-	DbgPrint("EINTIM: Proteus interface %d close results interrupt %x control %x\n",
-		slot->interfaceNumber, interruptClose, controlClose);
-	handle->driver = 0;
-	// The XDK exposes no close-completion callback here. Complete device removal
-	// before releasing TRBs and buffers so the USB stack can quiesce queued work.
+	int slotIndex = (int)(slot - g_slots);
+	InterlockedCompareExchange(&g_controlOwnerSlot, -1, slotIndex);
+	// Explicit endpoint closes can block during physical composite-device
+	// removal. Let the USB core cancel the pipes as part of remove completion;
+	// all TRB storage remains quarantined, so late callbacks stay memory-safe.
+	DbgPrint("EINTIM: Proteus interface %d calling kernel removal complete\n",
+		slot->interfaceNumber);
 	UsbdRemoveDeviceComplete(handle);
-	free(slot->inputBuffer);
-	slot->inputBuffer = 0;
-	delete slot->extension;
-	slot->extension = 0;
-	memset(slot, 0, sizeof(*slot));
+	DbgPrint("EINTIM: Proteus interface %d kernel removal returned\n",
+		slot->interfaceNumber);
+	slot->removeCompleteCalled = true;
+	UpdateRemovalReady(slot);
 	bool anySlotsRemain = false;
 	for (int i = 0; i < kSlotCount; ++i)
-		if (g_slots[i].handle) anySlotsRemain = true;
-	if (!anySlotsRemain) {
-		g_configurationBusy = false;
-		g_configured = false;
-		g_configurationDescriptorFetched = false;
-		memset(g_configurationDescriptor, 0, sizeof(g_configurationDescriptor));
-		memset(g_slotEndpointDescriptors, 0, sizeof(g_slotEndpointDescriptors));
-	} else StartNextConfiguration();
+		if (g_slots[i].handle && !g_slots[i].removing) anySlotsRemain = true;
+	if (anySlotsRemain) StartNextConfiguration();
 	return true;
 }
 
 void ProteusMaintenance(uint32_t nowMilliseconds) {
 	for (int i = 0; i < kSlotCount; ++i) {
 		ProteusSlot* slot = &g_slots[i];
+		if (slot->removing) {
+			if (!slot->loggedRemovalWait) {
+			slot->loggedRemovalWait = true;
+			DbgPrint("EINTIM: Proteus interface %d waiting for removal transfers input %d control %d\n",
+				slot->interfaceNumber, slot->inputPending, slot->controlBusy);
+			}
+			UpdateRemovalReady(slot);
+			if (slot->cleanupReady &&
+				(int32_t)(nowMilliseconds - slot->cleanupDeadline) >= 0)
+				FinalizeRemoval(slot);
+			continue;
+		}
+		if (slot->handle && !slot->removing && slot->listening &&
+			!slot->inputPending && slot->inputRetryDeadline != 0 &&
+			(int32_t)(nowMilliseconds - slot->inputRetryDeadline) >= 0)
+			QueueInput(slot);
+	}
+	for (int offset = 0; offset < kSlotCount; ++offset) {
+		int i = (g_nextHeartbeatSlot + offset) % kSlotCount;
+		ProteusSlot* slot = &g_slots[i];
 		if (!slot->handle || slot->removing || !slot->listening ||
 			!slot->heartbeatEnabled || slot->controlBusy) continue;
-		if ((int32_t)(nowMilliseconds - slot->heartbeatDeadline) >= 0)
-			QueueLizardOff(slot);
+		if ((int32_t)(nowMilliseconds - slot->heartbeatDeadline) >= 0 &&
+			QueueLizardOff(slot)) {
+			g_nextHeartbeatSlot = (i + 1) % kSlotCount;
+			break;
+		}
 	}
 }
