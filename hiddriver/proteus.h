@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "driver_types.h"
+#include "triton_protocol.h"
 
 bool ProteusIsSlot(uint16_t vendorId, uint16_t productId,
 	const usb_interface_descriptor* interfaceDescriptor);
@@ -12,5 +13,5 @@ bool ProteusRemoveSlotInterface(deviceHandle* handle);
 void ProteusMaintenance(uint32_t nowMilliseconds);
 
 // Implemented by main.cpp; these keep XAM ownership out of the USB transport.
-void ProteusPublishState(uint8_t interfaceNumber, const ButtonsReport& state);
+void ProteusPublishState(uint8_t interfaceNumber, const TritonProtocol::ControllerState& state);
 void ProteusDisconnectController(uint8_t interfaceNumber);

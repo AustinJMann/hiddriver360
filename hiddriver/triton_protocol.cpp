@@ -96,34 +96,33 @@ bool DecodeWirelessStatus(const uint8_t* bytes, size_t length, WirelessStatus* s
 	return true;
 }
 
-void ConvertToButtonsReport(const InputState& state, ButtonsReport* report) {
+void ConvertToControllerState(const InputState& state, ControllerState* report) {
 	if (!report) return;
 	memset(report, 0, sizeof(*report));
 	const uint32_t b = state.buttons;
-	report->has_hat_switch = false;
-	report->a_button = (b & kButtonA) != 0;
-	report->b_button = (b & kButtonB) != 0;
-	report->x_button = (b & kButtonX) != 0;
-	report->y_button = (b & kButtonY) != 0;
-	report->r3 = (b & kButtonR3) != 0;
-	report->start = (b & kButtonView) != 0;
-	report->r1 = (b & kButtonRB) != 0;
-	report->dpad_down = (b & kDpadDown) != 0;
-	report->dpad_right = (b & kDpadRight) != 0;
-	report->dpad_left = (b & kDpadLeft) != 0;
-	report->dpad_up = (b & kDpadUp) != 0;
-	report->back = (b & kButtonMenu) != 0;
-	report->l3 = (b & kButtonL3) != 0;
-	report->xbox = (b & kButtonSteam) != 0;
-	report->l1 = (b & kButtonLB) != 0;
-	report->x = state.leftX;
-	report->y = state.leftY;
-	report->z = state.rightX;
-	report->rz = state.rightY;
-	report->rx = ScaleTrigger(state.leftTrigger);
-	report->ry = ScaleTrigger(state.rightTrigger);
-	report->l2 = state.leftTrigger == 0 && (b & kButtonLTClick) != 0;
-	report->r2 = state.rightTrigger == 0 && (b & kButtonRTClick) != 0;
+	report->a = (b & kButtonA) != 0;
+	report->b = (b & kButtonB) != 0;
+	report->x = (b & kButtonX) != 0;
+	report->y = (b & kButtonY) != 0;
+	report->rightStick = (b & kButtonR3) != 0;
+	report->view = (b & kButtonView) != 0;
+	report->rightShoulder = (b & kButtonRB) != 0;
+	report->dpadDown = (b & kDpadDown) != 0;
+	report->dpadRight = (b & kDpadRight) != 0;
+	report->dpadLeft = (b & kDpadLeft) != 0;
+	report->dpadUp = (b & kDpadUp) != 0;
+	report->menu = (b & kButtonMenu) != 0;
+	report->leftStick = (b & kButtonL3) != 0;
+	report->guide = (b & kButtonSteam) != 0;
+	report->leftShoulder = (b & kButtonLB) != 0;
+	report->leftX = state.leftX;
+	report->leftY = state.leftY;
+	report->rightX = state.rightX;
+	report->rightY = state.rightY;
+	report->leftTrigger = ScaleTrigger(state.leftTrigger);
+	report->rightTrigger = ScaleTrigger(state.rightTrigger);
+	report->leftTriggerClick = state.leftTrigger == 0 && (b & kButtonLTClick) != 0;
+	report->rightTriggerClick = state.rightTrigger == 0 && (b & kButtonRTClick) != 0;
 }
 
 void BuildLizardOffFeatureReport(uint8_t report[kFeatureReportSize]) {

@@ -11,8 +11,6 @@ typedef int (*AddCompleteFn)(deviceHandle*, int);
 typedef int (*QueueTransferFn)(deviceHandle*, void*);
 typedef NTSTATUS (*OpenDefaultEndpointFn)(deviceHandle*, DWORD*);
 typedef NTSTATUS (*OpenEndpointFn)(deviceHandle*, int, int, int, int, DWORD*);
-typedef NTSTATUS (*CloseEndpointFn)(deviceHandle*, void*);
-typedef NTSTATUS (*CloseDefaultEndpointFn)(deviceHandle*, DWORD*);
 typedef NTSTATUS (*RemoveCompleteFn)(deviceHandle*);
 
 extern EndpointDescriptorFn UsbdGetEndpointDescriptor;
@@ -20,8 +18,6 @@ extern AddCompleteFn UsbdAddDeviceComplete;
 extern QueueTransferFn UsbdQueueAsyncTransfer;
 extern OpenDefaultEndpointFn UsbdOpenDefaultEndpoint;
 extern OpenEndpointFn UsbdOpenEndpoint;
-extern CloseEndpointFn UsbdQueueCloseEndpoint;
-extern CloseDefaultEndpointFn UsbdQueueCloseDefaultEndpoint;
 extern RemoveCompleteFn UsbdRemoveDeviceComplete;
 
 namespace {
@@ -43,7 +39,7 @@ enum ControlPurpose {
 
 struct ProteusSlot {
 	deviceHandle* handle;
-	HidControllerExtension* extension;
+	ProteusControllerExtension* extension;
 	uint8_t interfaceNumber;
 	uint8_t* inputBuffer;
 	uint16_t inputLength;
@@ -475,8 +471,8 @@ static int32_t InputComplete(DWORD trbAddress, int32_t status) {
 			DbgPrint("EINTIM: Proteus slot %d accepted state report %02x\n",
 				slot->interfaceNumber, input.reportId);
 		}
-		ButtonsReport report;
-		TritonProtocol::ConvertToButtonsReport(input, &report);
+		TritonProtocol::ControllerState report;
+		TritonProtocol::ConvertToControllerState(input, &report);
 		bool wasConnected = slot->connected;
 		slot->connected = true;
 		slot->heartbeatEnabled = true;
@@ -527,7 +523,7 @@ int ProteusAddSlotInterface(deviceHandle* handle,
 			slot->interfaceNumber);
 	}
 	slot->retryDelay = kHeartbeatRetryMs;
-	slot->extension = new HidControllerExtension();
+	slot->extension = new ProteusControllerExtension();
 	if (!slot->extension) { memset(slot, 0, sizeof(*slot)); return -1; }
 	memset(slot->extension, 0, sizeof(*slot->extension));
 	slot->extension->deviceHandle = handle;

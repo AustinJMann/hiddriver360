@@ -101,7 +101,18 @@ static void Put32(uint8_t* p, uint32_t v) {
 	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
 }
 
-static void TestEndianAndValidation() {
+static void TestAdmissionAndValidation() {
+	for (uint8_t interfaceNumber = kFirstSlotInterface;
+		interfaceNumber <= kLastSlotInterface; ++interfaceNumber)
+		assert(IsProteusSlotInterface(kValveVendorId, kProteusProductId,
+			interfaceNumber, 3, 0, 0));
+	assert(!IsProteusSlotInterface(kValveVendorId, kProteusProductId, 1, 3, 0, 0));
+	assert(!IsProteusSlotInterface(kValveVendorId, kProteusProductId, 6, 3, 0, 0));
+	assert(!IsProteusSlotInterface(0x1234, kProteusProductId, 2, 3, 0, 0));
+	assert(!IsProteusSlotInterface(kValveVendorId, 0x5678, 2, 3, 0, 0));
+	assert(!IsProteusSlotInterface(kValveVendorId, kProteusProductId, 2, 2, 0, 0));
+	assert(!IsProteusSlotInterface(kValveVendorId, kProteusProductId, 2, 3, 1, 0));
+	assert(!IsProteusSlotInterface(kValveVendorId, kProteusProductId, 2, 3, 0, 1));
 	const uint8_t bytes[] = { 0x34, 0x12, 0x78, 0x56 };
 	assert(ReadLE16(bytes) == 0x1234);
 	assert(ReadSLE16((const uint8_t*)"\xff\xff") == -1);
@@ -147,18 +158,25 @@ static void TestButtonsAndTriggers() {
 	Put16(packet + 6, 1); Put16(packet + 8, 32767);
 	InputState state = {};
 	assert(DecodeInputPrefix(packet, sizeof(packet), &state));
-	ButtonsReport b;
-	ConvertToButtonsReport(state, &b);
-	assert(b.a_button && b.b_button && b.x_button && b.y_button);
-	assert(b.l1 && b.r1 && b.l3 && b.r3 && b.start && b.back && b.xbox);
-	assert(b.dpad_up && b.dpad_down && b.dpad_left && b.dpad_right);
-	assert(b.rx == 0 && b.ry == 255);
+	ControllerState b;
+	ConvertToControllerState(state, &b);
+	assert(b.a && b.b && b.x && b.y);
+	assert(b.leftShoulder && b.rightShoulder && b.leftStick && b.rightStick &&
+		b.menu && b.view && b.guide);
+	assert(b.dpadUp && b.dpadDown && b.dpadLeft && b.dpadRight);
+	assert(b.leftTrigger == 0 && b.rightTrigger == 255);
 	packet[2] = packet[3] = packet[4] = packet[5] = 0;
 	Put32(packet + 2, 0x08000000 | 0x00800000);
 	Put16(packet + 6, 0); Put16(packet + 8, 0);
 	assert(DecodeInputPrefix(packet, sizeof(packet), &state));
-	ConvertToButtonsReport(state, &b);
-	assert(b.l2 && b.r2 && b.rx == 0 && b.ry == 0);
+	ConvertToControllerState(state, &b);
+	assert(b.leftTriggerClick && b.rightTriggerClick &&
+		b.leftTrigger == 0 && b.rightTrigger == 0);
+	Put16(packet + 6, 1); Put16(packet + 8, 16384);
+	assert(DecodeInputPrefix(packet, sizeof(packet), &state));
+	ConvertToControllerState(state, &b);
+	assert(b.leftTrigger == 0);
+	assert(b.rightTrigger == 128);
 }
 
 static void TestStatusAndFeature() {
@@ -171,6 +189,14 @@ static void TestStatusAndFeature() {
 			assert(status == (WirelessStatus)value);
 		}
 	}
+	WirelessStatus unchanged = kWirelessConnected;
+	const uint8_t truncated[] = { 0x46 };
+	const uint8_t invalidId[] = { 0x48, 1 };
+	const uint8_t invalidValue[] = { 0x46, 3 };
+	assert(!DecodeWirelessStatus(truncated, sizeof(truncated), &unchanged));
+	assert(!DecodeWirelessStatus(invalidId, sizeof(invalidId), &unchanged));
+	assert(!DecodeWirelessStatus(invalidValue, sizeof(invalidValue), &unchanged));
+	assert(unchanged == kWirelessConnected);
 	uint8_t report[64]; memset(report, 0xcc, sizeof(report));
 	BuildLizardOffFeatureReport(report);
 	assert(report[0] == 1 && report[1] == 0x87 && report[2] == 3 && report[3] == 9);
@@ -303,7 +329,7 @@ static void TestRoutingRemovalOrdersAndGuideDebounce() {
 }
 
 int main() {
-	TestEndianAndValidation();
+	TestAdmissionAndValidation();
 	TestStateIdsAndAxes();
 	TestButtonsAndTriggers();
 	TestStatusAndFeature();

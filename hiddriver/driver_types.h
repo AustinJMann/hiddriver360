@@ -32,15 +32,8 @@ struct UsbControlTrb {
 	UsbPacket packet;
 };
 
-enum InitState {
-	INIT_SET_CONFIGURATION,
-	INIT_GET_REPORT_DESCRIPTOR,
-	INIT_DONE,
-	INIT_FAILED
-};
-
 struct deviceHandle;
-struct __declspec(align(2)) HidControllerExtension {
+struct __declspec(align(2)) ProteusControllerExtension {
 	deviceHandle* deviceHandle;
 	UsbTrb interruptTrb;
 	uint8_t interfaceNumber;
@@ -61,25 +54,22 @@ struct __declspec(align(2)) HidControllerExtension {
 	uint8_t alwaysZeroThree;
 	uint8_t alwaysZeroFour;
 
-	// Driver-owned state. Appended so the kernel-observed prefix remains unchanged.
-	InitState initState;
-	int controllerIndex;
-	usb_hid_descriptor hidDescriptor;
-	void* reportDescriptorBuffer;
-	uint16_t reportDescriptorLength;
-	uint8_t controlBusy;
-	uint8_t removing;
 };
 
 struct deviceHandle {
-	HidControllerExtension* driver;
+	ProteusControllerExtension* driver;
 };
 
-inline HidControllerExtension* ExtensionFromInterruptTrb(void* trb) {
-	return (HidControllerExtension*)((uint8_t*)trb - offsetof(HidControllerExtension, interruptTrb));
-}
-
-inline HidControllerExtension* ExtensionFromControlTrb(void* trb) {
-	return (HidControllerExtension*)((uint8_t*)trb - offsetof(HidControllerExtension, controlTrb));
-}
+static_assert(offsetof(ProteusControllerExtension, interruptTrb) == 0x04,
+	"USB extension interrupt TRB offset changed");
+static_assert(offsetof(ProteusControllerExtension, interfaceNumber) == 0x20,
+	"USB extension interface offset changed");
+static_assert(offsetof(ProteusControllerExtension, controlTrb) == 0x24,
+	"USB extension control TRB offset changed");
+static_assert(offsetof(ProteusControllerExtension, cleanupHandler) == 0x50,
+	"USB extension cleanup handler offset changed");
+static_assert(offsetof(ProteusControllerExtension, queue) == 0x6c,
+	"USB extension queue offset changed");
+static_assert(sizeof(ProteusControllerExtension) == 0x7c,
+	"USB extension kernel-observed prefix size changed");
 
