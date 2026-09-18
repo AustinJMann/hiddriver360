@@ -120,7 +120,7 @@ static void FinalizeRemoval(ProteusSlot* slot) {
 	// the remainder of this driver session instead of risking a use-after-free.
 	memset(slot, 0, sizeof(*slot));
 	MemoryBarrier();
-	DbgPrint("EINTIM: Proteus interface %d removal complete; USB storage quarantined\n",
+	DbgPrint("TritonDriver: Proteus interface %d removal complete; USB storage quarantined\n",
 		interfaceNumber);
 	bool anySlotsRemain = false;
 	for (int i = 0; i < kSlotCount; ++i)
@@ -162,7 +162,7 @@ static bool QueueControl(ProteusSlot* slot, ControlPurpose purpose,
 	int queueToken = UsbdQueueAsyncTransfer(slot->handle, control);
 	if (!slot->loggedControlQueueResult) {
 		slot->loggedControlQueueResult = true;
-		DbgPrint("EINTIM: Proteus slot %d control transfer queued token %x request %02x value %04x\n",
+		DbgPrint("TritonDriver: Proteus slot %d control transfer queued token %x request %02x value %04x\n",
 			slot->interfaceNumber, queueToken, request, value);
 	}
 	return true;
@@ -212,7 +212,7 @@ static void ParseConfigurationDescriptor() {
 				int slotIndex = currentInterface - TritonProtocol::kFirstSlotInterface;
 				memset(&g_slotEndpointDescriptors[slotIndex], 0, sizeof(g_slotEndpointDescriptors[slotIndex]));
 				memcpy(&g_slotEndpointDescriptors[slotIndex], endpoint, 7);
-				DbgPrint("EINTIM: Proteus configuration maps interface %d to endpoint %02x size %d interval %d\n",
+				DbgPrint("TritonDriver: Proteus configuration maps interface %d to endpoint %02x size %d interval %d\n",
 					currentInterface, endpoint->bEndpointAddress,
 					TritonProtocol::ReadLE16((const uint8_t*)&endpoint->wMaxPacketSize),
 					endpoint->bInterval);
@@ -255,23 +255,23 @@ static bool StartListening(ProteusSlot* slot) {
 			slot->handle, slot->interfaceNumber, 3, 1);
 		if (indexed) {
 			memcpy(&slot->endpointDescriptor, indexed, sizeof(slot->endpointDescriptor));
-			DbgPrint("EINTIM: Proteus interface %d indexed endpoint %02x descriptor %p\n",
+			DbgPrint("TritonDriver: Proteus interface %d indexed endpoint %02x descriptor %p\n",
 				slot->interfaceNumber, indexed->bEndpointAddress, indexed);
 		} else {
 			usb_endpoint_descriptor* fallback = UsbdGetEndpointDescriptor(slot->handle, 0, 3, 1);
 			if (fallback) memcpy(&slot->endpointDescriptor, fallback, sizeof(slot->endpointDescriptor));
-			DbgPrint("EINTIM: Proteus interface %d indexed lookup failed; fallback endpoint %02x\n",
+			DbgPrint("TritonDriver: Proteus interface %d indexed lookup failed; fallback endpoint %02x\n",
 				slot->interfaceNumber, fallback ? fallback->bEndpointAddress : 0);
 		}
 	}
 	endpoint = &slot->endpointDescriptor;
 	if (!endpoint) {
-		DbgPrint("EINTIM: Proteus interface %d has no interrupt-IN endpoint\n", slot->interfaceNumber);
+		DbgPrint("TritonDriver: Proteus interface %d has no interrupt-IN endpoint\n", slot->interfaceNumber);
 		return false;
 	}
 	uint16_t packetSize = Swap16(endpoint->wMaxPacketSize) & 0x7ff;
 	if (packetSize == 0 || packetSize > kMaxHidPacketSize) {
-		DbgPrint("EINTIM: Proteus interface %d invalid packet size %d\n", slot->interfaceNumber, packetSize);
+		DbgPrint("TritonDriver: Proteus interface %d invalid packet size %d\n", slot->interfaceNumber, packetSize);
 		return false;
 	}
 	NTSTATUS result = UsbdOpenEndpoint(slot->handle, 3, endpoint->bEndpointAddress,
@@ -281,7 +281,7 @@ static bool StartListening(ProteusSlot* slot) {
 	if (!slot->inputBuffer) return false;
 	slot->inputLength = packetSize;
 	slot->listening = true;
-	DbgPrint("EINTIM: Proteus slot interface %d listening endpoint %02x size %d interval %d\n",
+	DbgPrint("TritonDriver: Proteus slot interface %d listening endpoint %02x size %d interval %d\n",
 		slot->interfaceNumber, endpoint->bEndpointAddress, packetSize, endpoint->bInterval);
 	QueueInput(slot);
 	// Do not probe empty bond slots on the puck-wide control endpoint. Wireless
@@ -312,7 +312,7 @@ static void StartNextConfiguration() {
 			if (slot->handle && slot->configurationPending && !slot->removing) {
 				slot->configurationPending = false;
 				if (!StartListening(slot))
-					DbgPrint("EINTIM: Proteus slot %d endpoint initialization failed\n", slot->interfaceNumber);
+					DbgPrint("TritonDriver: Proteus slot %d endpoint initialization failed\n", slot->interfaceNumber);
 			}
 		}
 		return;
@@ -346,7 +346,7 @@ static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 		if (status == 0) {
 			ParseConfigurationDescriptor();
 		} else {
-			DbgPrint("EINTIM: Proteus configuration descriptor request failed: %x\n", status);
+			DbgPrint("TritonDriver: Proteus configuration descriptor request failed: %x\n", status);
 		}
 		g_configurationDescriptorFetched = true;
 		slot->controlBusy = false;
@@ -358,9 +358,9 @@ static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 		if (status == 0) {
 			g_configured = true;
 			if (!StartListening(slot))
-				DbgPrint("EINTIM: Proteus slot %d endpoint initialization failed\n", slot->interfaceNumber);
+				DbgPrint("TritonDriver: Proteus slot %d endpoint initialization failed\n", slot->interfaceNumber);
 		} else {
-			DbgPrint("EINTIM: Proteus slot %d configuration failed: %x\n", slot->interfaceNumber, status);
+			DbgPrint("TritonDriver: Proteus slot %d configuration failed: %x\n", slot->interfaceNumber, status);
 			slot->configurationPending = true;
 		}
 		slot->controlBusy = false;
@@ -374,11 +374,11 @@ static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 	if (status == 0) {
 		if (!slot->loggedLizardSuccess) {
 			slot->loggedLizardSuccess = true;
-			DbgPrint("EINTIM: Proteus slot %d lizard-off request completed successfully\n",
+			DbgPrint("TritonDriver: Proteus slot %d lizard-off request completed successfully\n",
 				slot->interfaceNumber);
 		}
 		if (!slot->inputPending && slot->inputRetryDeadline == 0) {
-			DbgPrint("EINTIM: Proteus slot %d arming input after raw-mode success\n",
+			DbgPrint("TritonDriver: Proteus slot %d arming input after raw-mode success\n",
 				slot->interfaceNumber);
 			QueueInput(slot);
 		}
@@ -389,10 +389,10 @@ static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 	} else {
 		++slot->featureFailureCount;
 		if (slot->featureFailureCount <= 3 || slot->connected)
-			DbgPrint("EINTIM: Proteus slot %d lizard-off request failed: %x\n", slot->interfaceNumber, status);
+			DbgPrint("TritonDriver: Proteus slot %d lizard-off request failed: %x\n", slot->interfaceNumber, status);
 		if (!slot->connected && slot->featureFailureCount >= 3) {
 			slot->heartbeatEnabled = false;
-			DbgPrint("EINTIM: Proteus slot %d empty; pausing lizard probes until wireless activity\n",
+			DbgPrint("TritonDriver: Proteus slot %d empty; pausing lizard probes until wireless activity\n",
 				slot->interfaceNumber);
 			slot->controlBusy = false;
 			StartNextConfiguration();
@@ -422,7 +422,7 @@ static void QueueInput(ProteusSlot* slot) {
 	slot->inputRetryDeadline = 0;
 	if (!slot->loggedInputQueueResult) {
 		slot->loggedInputQueueResult = true;
-		DbgPrint("EINTIM: Proteus slot %d input transfer queued token %x endpoint %02x\n",
+		DbgPrint("TritonDriver: Proteus slot %d input transfer queued token %x endpoint %02x\n",
 			slot->interfaceNumber, queueToken, slot->endpointDescriptor.bEndpointAddress);
 	}
 }
@@ -437,14 +437,14 @@ static int32_t InputComplete(DWORD trbAddress, int32_t status) {
 	}
 	if (!slot->loggedInputCompletion) {
 		slot->loggedInputCompletion = true;
-		DbgPrint("EINTIM: Proteus slot %d first input completion status %x\n",
+		DbgPrint("TritonDriver: Proteus slot %d first input completion status %x\n",
 			slot->interfaceNumber, status);
 	}
 	if (status != 0) {
 		++slot->inputErrorCount;
 		if (slot->inputErrorCount <= 3 ||
 			(slot->inputErrorCount & (slot->inputErrorCount - 1)) == 0)
-			DbgPrint("EINTIM: Proteus slot %d input error %x count %d; retrying with backoff\n",
+			DbgPrint("TritonDriver: Proteus slot %d input error %x count %d; retrying with backoff\n",
 				slot->interfaceNumber, status, slot->inputErrorCount);
 		if (slot->connected) ProteusDisconnectController(slot->interfaceNumber);
 		slot->connected = false;
@@ -462,13 +462,13 @@ static int32_t InputComplete(DWORD trbAddress, int32_t status) {
 	TritonProtocol::WirelessStatus wireless;
 	if (!slot->loggedFirstReport) {
 		slot->loggedFirstReport = true;
-		DbgPrint("EINTIM: Proteus slot %d first interrupt report id %02x\n",
+		DbgPrint("TritonDriver: Proteus slot %d first interrupt report id %02x\n",
 			slot->interfaceNumber, slot->inputBuffer[0]);
 	}
 	if (TritonProtocol::DecodeInputPrefix(slot->inputBuffer, slot->inputLength, &input)) {
 		if (!slot->loggedFirstState) {
 			slot->loggedFirstState = true;
-			DbgPrint("EINTIM: Proteus slot %d accepted state report %02x\n",
+			DbgPrint("TritonDriver: Proteus slot %d accepted state report %02x\n",
 				slot->interfaceNumber, input.reportId);
 		}
 		TritonProtocol::ControllerState report;
@@ -516,10 +516,10 @@ int ProteusAddSlotInterface(deviceHandle* handle,
 	usb_endpoint_descriptor* interfaceEndpoint =
 		ScanInterfaceInterruptInEndpoint(descriptor, &slot->endpointDescriptor);
 	if (interfaceEndpoint) {
-		DbgPrint("EINTIM: Proteus interface %d descriptor-local endpoint %02x\n",
+		DbgPrint("TritonDriver: Proteus interface %d descriptor-local endpoint %02x\n",
 			slot->interfaceNumber, interfaceEndpoint->bEndpointAddress);
 	} else {
-		DbgPrint("EINTIM: Proteus interface %d could not find descriptor-local endpoint; using kernel lookup\n",
+		DbgPrint("TritonDriver: Proteus interface %d could not find descriptor-local endpoint; using kernel lookup\n",
 			slot->interfaceNumber);
 	}
 	slot->retryDelay = kHeartbeatRetryMs;
@@ -538,7 +538,7 @@ int ProteusAddSlotInterface(deviceHandle* handle,
 		memset(slot, 0, sizeof(*slot));
 		return result;
 	}
-	DbgPrint("EINTIM: Proteus slot interface %d initializing\n", slot->interfaceNumber);
+	DbgPrint("TritonDriver: Proteus slot interface %d initializing\n", slot->interfaceNumber);
 	slot->configurationPending = true;
 	StartNextConfiguration();
 	return 0;
@@ -549,7 +549,7 @@ bool ProteusRemoveSlotInterface(deviceHandle* handle) {
 	if (!slot) return false;
 	if (slot->removing) return true;
 	slot->removing = true;
-	DbgPrint("EINTIM: Proteus interface %d removal begin input %d control %d\n",
+	DbgPrint("TritonDriver: Proteus interface %d removal begin input %d control %d\n",
 		slot->interfaceNumber, slot->inputPending, slot->controlBusy);
 	ProteusDisconnectController(slot->interfaceNumber);
 	if (slot->controlPurpose == kControlGetConfigurationDescriptor ||
@@ -560,10 +560,10 @@ bool ProteusRemoveSlotInterface(deviceHandle* handle) {
 	// Explicit endpoint closes can block during physical composite-device
 	// removal. Let the USB core cancel the pipes as part of remove completion;
 	// all TRB storage remains quarantined, so late callbacks stay memory-safe.
-	DbgPrint("EINTIM: Proteus interface %d calling kernel removal complete\n",
+	DbgPrint("TritonDriver: Proteus interface %d calling kernel removal complete\n",
 		slot->interfaceNumber);
 	UsbdRemoveDeviceComplete(handle);
-	DbgPrint("EINTIM: Proteus interface %d kernel removal returned\n",
+	DbgPrint("TritonDriver: Proteus interface %d kernel removal returned\n",
 		slot->interfaceNumber);
 	slot->removeCompleteCalled = true;
 	UpdateRemovalReady(slot);
@@ -580,7 +580,7 @@ void ProteusMaintenance(uint32_t nowMilliseconds) {
 		if (slot->removing) {
 			if (!slot->loggedRemovalWait) {
 			slot->loggedRemovalWait = true;
-			DbgPrint("EINTIM: Proteus interface %d waiting for removal transfers input %d control %d\n",
+			DbgPrint("TritonDriver: Proteus interface %d waiting for removal transfers input %d control %d\n",
 				slot->interfaceNumber, slot->inputPending, slot->controlBusy);
 			}
 			UpdateRemovalReady(slot);
