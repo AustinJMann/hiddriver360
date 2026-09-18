@@ -12,6 +12,10 @@
 static const int kControllerCount = 4;
 static const DWORD kDeviceContextBase = 0x10000005;
 static const DWORD kGuideCooldownMs = 1000;
+// UsbdQueueAsyncTransfer requires hardware thread 2 and IRQL >= 2.
+// Affinity alone does not serialize a worker with the USB completion DPCs.
+static const DWORD kUsbProcessor = 2;
+static const BYTE kUsbDispatchLevel = 2;
 
 Detour g_hidAddDeviceDetour;
 Detour g_hidRemoveDeviceDetour;
@@ -99,7 +103,7 @@ HANDLE MakeSystemThread(LPTHREAD_START_ROUTINE entry, PVOID argument) {
 	ExCreateThread(&thread, 0, 0, XapiThreadStartup, entry, argument,
 		EX_CREATE_FLAG_SUSPENDED | EX_CREATE_FLAG_SYSTEM | 0x18000424);
 	if (!thread) return 0;
-	XSetThreadProcessor(thread, 4);
+	XSetThreadProcessor(thread, kUsbProcessor);
 	SetThreadPriority(thread, THREAD_PRIORITY_NORMAL);
 	ResumeThread(thread);
 	return thread;
@@ -213,9 +217,22 @@ void ProcessProteusEvents() {
 }
 
 unsigned int __stdcall ProteusServiceThreadProc(void*) {
+	if (GetCurrentProcessorNumber() != kUsbProcessor) {
+		DbgPrint("TritonDriver: USB service affinity incorrect; refusing unsafe USB maintenance\n");
+		return ERROR_INVALID_FUNCTION;
+	}
+	DbgPrint("TritonDriver: USB maintenance on hardware thread %d at IRQL %d\n",
+		kUsbProcessor, kUsbDispatchLevel);
 	for (;;) {
+		// XAM binding and sleeping must stay at normal thread IRQL.
 		ProcessProteusEvents();
-		ProteusMaintenance(GetTickCount());
+		DWORD now = GetTickCount();
+		// Run on the USB processor with its completion DPCs excluded. Submitting
+		// from CPU 4 / passive level races the kernel's USB transfer free lists;
+		// per-slot inputPending/controlBusy flags cannot protect those lists.
+		BYTE previousIrql = KfRaiseIrql(kUsbDispatchLevel);
+		ProteusMaintenance(now);
+		KfLowerIrql(previousIrql);
 		Sleep(100);
 	}
 }

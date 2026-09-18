@@ -51,7 +51,7 @@ struct ProteusSlot {
 	uint32_t inputErrorCount;
 	uint8_t featureFailureCount;
 	bool listening;
-	volatile bool inputPending;
+	volatile LONG inputPending;
 	bool connected;
 	bool heartbeatEnabled;
 	volatile bool controlBusy;
@@ -96,7 +96,7 @@ static ProteusSlot* FindSlotByHandle(deviceHandle* handle) {
 	return 0;
 }
 
-static void QueueInput(ProteusSlot* slot);
+static int32_t QueueInput(ProteusSlot* slot);
 static int32_t InputComplete(DWORD trbAddress, int32_t status);
 static int32_t ControlComplete(DWORD trbAddress, int32_t status);
 static void StartNextConfiguration();
@@ -154,11 +154,10 @@ static bool QueueControl(ProteusSlot* slot, ControlPurpose purpose,
 	control->packet.wLength = Swap16(length);
 	control->trb.buffer = data;
 	control->trb.length = length;
-	control->trb.flags = 1;
-	control->trb.callback = (DWORD)ControlComplete;
-	control->trb.savedEndpoint = control->trb.endpoint;
 	slot->controlBusy = true;
 	slot->controlPurpose = purpose;
+	// This API returns an opaque queue token, which may have its high bit set;
+	// completion status is delivered only through ControlComplete.
 	int queueToken = UsbdQueueAsyncTransfer(slot->handle, control);
 	if (!slot->loggedControlQueueResult) {
 		slot->loggedControlQueueResult = true;
@@ -280,6 +279,14 @@ static bool StartListening(ProteusSlot* slot) {
 	slot->inputBuffer = (uint8_t*)calloc(1, packetSize);
 	if (!slot->inputBuffer) return false;
 	slot->inputLength = packetSize;
+	UsbTrb* inputTrb = &slot->extension->interruptTrb;
+	inputTrb->buffer = slot->inputBuffer;
+	inputTrb->length = slot->inputLength;
+	inputTrb->flags = 1;
+	inputTrb->callback = (DWORD)InputComplete;
+	// OpenEndpoint supplies the persistent endpoint pointer. Preserve it once;
+	// the queue implementation may reuse trb.endpoint while the request runs.
+	inputTrb->savedEndpoint = inputTrb->endpoint;
 	slot->listening = true;
 	DbgPrint("TritonDriver: Proteus slot interface %d listening endpoint %02x size %d interval %d\n",
 		slot->interfaceNumber, endpoint->bEndpointAddress, packetSize, endpoint->bInterval);
@@ -377,11 +384,6 @@ static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 			DbgPrint("TritonDriver: Proteus slot %d lizard-off request completed successfully\n",
 				slot->interfaceNumber);
 		}
-		if (!slot->inputPending && slot->inputRetryDeadline == 0) {
-			DbgPrint("TritonDriver: Proteus slot %d arming input after raw-mode success\n",
-				slot->interfaceNumber);
-			QueueInput(slot);
-		}
 		slot->retryDelay = kHeartbeatRetryMs;
 		slot->featureFailureCount = 0;
 		slot->heartbeatEnabled = true;
@@ -408,29 +410,33 @@ static int32_t ControlComplete(DWORD trbAddress, int32_t status) {
 	return status;
 }
 
-static void QueueInput(ProteusSlot* slot) {
-	if (!slot || slot->removing || !slot->listening || slot->inputPending) return;
+static int32_t QueueInput(ProteusSlot* slot) {
+	if (!slot || slot->removing || !slot->listening) return 0;
+	// The interrupt callback and maintenance thread may both try to recover the
+	// input pipe. Claim the single reusable TRB before touching or queueing it.
+	if (InterlockedCompareExchange(&slot->inputPending, 1, 0) != 0) return 0;
+	slot->inputRetryDeadline = 0;
 	memset(slot->inputBuffer, 0, slot->inputLength);
 	UsbTrb* trb = &slot->extension->interruptTrb;
-	trb->buffer = slot->inputBuffer;
-	trb->length = slot->inputLength;
-	trb->flags = 1;
-	trb->callback = (DWORD)InputComplete;
-	trb->savedEndpoint = trb->endpoint;
+	// As with control transfers, the return value is an opaque queue token.
+	// Keep ownership until InputComplete releases it.
 	int queueToken = UsbdQueueAsyncTransfer(slot->handle, trb);
-	slot->inputPending = true;
-	slot->inputRetryDeadline = 0;
 	if (!slot->loggedInputQueueResult) {
 		slot->loggedInputQueueResult = true;
 		DbgPrint("TritonDriver: Proteus slot %d input transfer queued token %x endpoint %02x\n",
 			slot->interfaceNumber, queueToken, slot->endpointDescriptor.bEndpointAddress);
 	}
+	return queueToken;
 }
 
 static int32_t InputComplete(DWORD trbAddress, int32_t status) {
 	ProteusSlot* slot = FindSlotByInterruptTrb((void*)trbAddress);
 	if (!slot) return status;
-	slot->inputPending = false;
+	if (InterlockedCompareExchange(&slot->inputPending, 0, 1) != 1) {
+		DbgPrint("TritonDriver: Proteus slot %d unexpected input completion with no transfer pending\n",
+			slot->interfaceNumber);
+		return status;
+	}
 	if (slot->removing) {
 		UpdateRemovalReady(slot);
 		return status;
@@ -493,8 +499,7 @@ static int32_t InputComplete(DWORD trbAddress, int32_t status) {
 				slot->heartbeatDeadline = 0;
 		}
 	}
-	QueueInput(slot);
-	return status;
+	return QueueInput(slot);
 }
 
 } // namespace
@@ -538,6 +543,12 @@ int ProteusAddSlotInterface(deviceHandle* handle,
 		memset(slot, 0, sizeof(*slot));
 		return result;
 	}
+	UsbTrb* controlTrb = &slot->extension->controlTrb.trb;
+	controlTrb->flags = 1;
+	controlTrb->callback = (DWORD)ControlComplete;
+	// As with the interrupt TRB, keep the endpoint saved by the open call stable
+	// for every later configuration and feature transfer.
+	controlTrb->savedEndpoint = controlTrb->endpoint;
 	DbgPrint("TritonDriver: Proteus slot interface %d initializing\n", slot->interfaceNumber);
 	slot->configurationPending = true;
 	StartNextConfiguration();
