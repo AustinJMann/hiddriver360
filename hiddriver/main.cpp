@@ -8,10 +8,19 @@
 #include <sstream>
 #include <vector>
 #include "Detours.h"
+<<<<<<< Updated upstream
 #include "hid_parser.h"  
+=======
+#include "driver_types.h"
+#include "proteus.h"
+#include "proteus_routing.h"
+#include "rumble_output.h"
+#include "triton_protocol.h"
+>>>>>>> Stashed changes
 #include "usb.h"
 #include "mapping.h"
 
+<<<<<<< Updated upstream
 Detour HidAddDeviceDetour;
 Detour HidRemoveDeviceDetour;
 Detour XamInputSetStateDetour;
@@ -21,6 +30,93 @@ Detour XInputdReadStateDetour;
 uint16_t swap_endianness_16(uint16_t val) {
 	return (val >> 8) | (val << 8);
 }
+=======
+static const int kControllerCount = 4;
+static const DWORD kDeviceContextBase = 0x10000005;
+static const DWORD kGuideCooldownMs = 1000;
+// UsbdQueueAsyncTransfer requires hardware thread 2 and IRQL >= 2.
+// Affinity alone does not serialize a worker with the USB completion DPCs.
+static const DWORD kUsbProcessor = 2;
+static const BYTE kUsbDispatchLevel = 2;
+
+Detour g_hidAddDeviceDetour;
+Detour g_hidRemoveDeviceDetour;
+Detour g_xamInputSetStateDetour;
+Detour g_xamInputGetCapabilitiesDetour;
+Detour g_xinputReadStateDetour;
+
+typedef struct _XINPUT_CAPABILITIESEX {
+	BYTE Type;
+	BYTE SubType;
+	WORD Flags;
+	XINPUT_GAMEPAD Gamepad;
+	XINPUT_VIBRATION Vibration;
+	DWORD reserved1;
+	DWORD reserved2;
+	DWORD reserved3;
+} XINPUT_CAPABILITIES_EX, *PXINPUT_CAPABILITIES_EX;
+
+typedef usb_device_descriptor* (*UsbDeviceDescriptorFn)(deviceHandle*);
+typedef usb_interface_descriptor* (*UsbInterfaceDescriptorFn)(deviceHandle*);
+typedef usb_endpoint_descriptor* (*EndpointDescriptorFn)(deviceHandle*, int, int, int);
+typedef int (*AddCompleteFn)(deviceHandle*, int);
+typedef int (*QueueTransferFn)(deviceHandle*, void*);
+typedef NTSTATUS (*OpenDefaultEndpointFn)(deviceHandle*, DWORD*);
+typedef NTSTATUS (*OpenEndpointFn)(deviceHandle*, int, int, int, int, DWORD*);
+typedef NTSTATUS (*RemoveCompleteFn)(deviceHandle*);
+typedef int (*XamBindDeviceFn)(unsigned int, unsigned int, unsigned __int8, bool, unsigned __int8*);
+typedef int (*UsbNotificationFn)();
+typedef void (*FreePhysicalMemoryFn)(DWORD, DWORD);
+
+UsbDeviceDescriptorFn UsbdGetDeviceDescriptor = 0;
+UsbInterfaceDescriptorFn UsbdGetInterfaceDescriptor = 0;
+EndpointDescriptorFn UsbdGetEndpointDescriptor = 0;
+AddCompleteFn UsbdAddDeviceComplete = 0;
+OpenDefaultEndpointFn UsbdOpenDefaultEndpoint = 0;
+OpenEndpointFn UsbdOpenEndpoint = 0;
+QueueTransferFn UsbdQueueAsyncTransfer = 0;
+RemoveCompleteFn UsbdRemoveDeviceComplete = 0;
+XamBindDeviceFn XamUserBindDeviceCallback = 0;
+
+UsbNotificationFn g_usbdPowerDownNotification = 0;
+UsbNotificationFn g_usbdDriverEntry = 0;
+FreePhysicalMemoryFn g_freePhysicalMemory = 0;
+void* g_xamInputSetState = 0;
+void* g_xamInputGetCapabilities = 0;
+void* g_xinputReadState = 0;
+bool g_isDevkit = true;
+DWORD g_usbPhysicalPage = 0;
+
+struct TritonVirtualController {
+	volatile LONG inUse;
+	uint8_t userIndex;
+	uint8_t slotIndex;
+	uint16_t reserved;
+	uint32_t deviceContext;
+	volatile LONG packetNumber;
+	DWORD guideLastPressTime;
+	uint32_t slotGeneration;
+} __declspec(align(4));
+
+struct ProteusRoutingSlot {
+	TritonProtocol::ControllerState stateBuffers[2];
+	volatile LONG publishedStateIndex;
+	volatile LONG stateSequence;
+	volatile LONG connected;
+	volatile LONG disconnectPending;
+	volatile LONG controllerIndex;
+	volatile LONG generation;
+};
+
+TritonVirtualController g_controllers[kControllerCount];
+ProteusRoutingSlot g_proteusSlots[ProteusRouting::kSlotCount];
+// One atomic word holds both motor strengths and the owning binding. Keep it
+// separate from state buffers so no USB/DPC path ever waits for a game thread.
+__declspec(align(8)) volatile LONG64 g_rumbleRequests[ProteusRouting::kSlotCount];
+static volatile LONG g_abortServiceStartup;
+
+uint16_t Swap16(uint16_t value) { return (uint16_t)((value >> 8) | (value << 8)); }
+>>>>>>> Stashed changes
 
 BOOL IsTrayOpen() {
 	BYTE Input[0x10] = { 0 }, Output[0x10] = { 0 };
@@ -39,6 +135,7 @@ HANDLE MakeThread(LPTHREAD_START_ROUTINE Address, PVOID arg) {
 	return Handle;
 }
 
+<<<<<<< Updated upstream
 void XNotifyUI(XNOTIFYQUEUEUI_TYPE Type, PWCHAR String) { XNotifyQueueUI(Type, XUSER_INDEX_ANY, XNOTIFYUI_PRIORITY_DEFAULT, String, 0); }
 
 struct UsbTrb {
@@ -192,6 +289,15 @@ int16_t normalize_stick(uint16_t raw) {
 	raw = clamp_u16(raw, STICK_MIN, STICK_MAX);
 	if (raw >= STICK_CENTER) {
 		return (int16_t)((int32_t)(raw - STICK_CENTER) * 32767 / (STICK_CENTER - STICK_MIN));
+=======
+void InitializeRouting() {
+	memset(g_controllers, 0, sizeof(g_controllers));
+	memset(g_proteusSlots, 0, sizeof(g_proteusSlots));
+	memset((void*)g_rumbleRequests, 0, sizeof(g_rumbleRequests));
+	for (int i = 0; i < ProteusRouting::kSlotCount; ++i) {
+		g_proteusSlots[i].controllerIndex = ProteusRouting::kUnboundController;
+		g_proteusSlots[i].generation = 1;
+>>>>>>> Stashed changes
 	}
 	else {
 		return (int16_t)((int32_t)(STICK_CENTER - raw) * -32768 / (STICK_CENTER - STICK_MIN));
@@ -327,6 +433,7 @@ HID_ReportItem_t* FindItemByUsage(
 	return nullptr;
 }
 
+<<<<<<< Updated upstream
 HID_ReportItem_t* FindButtonItem(
 	HID_ReportInfo_t* info,
 	uint8_t buttonIdx,
@@ -348,6 +455,118 @@ uint8_t FindGamepadReportId(HID_ReportInfo_t* info) {
 		uint16_t u = item->Attributes.Usage.Usage;
 		if (u >= HID_USAGE_AXIS_X && u <= HID_USAGE_AXIS_RZ)
 			return item->ReportID;
+=======
+void UnbindController(int slotIndex) {
+	InterlockedExchange64(&g_rumbleRequests[slotIndex], 0);
+	ProteusRoutingSlot& slot = g_proteusSlots[slotIndex];
+	int controllerIndex = slot.controllerIndex;
+	if (controllerIndex < 0 || controllerIndex >= kControllerCount) return;
+	TritonVirtualController& controller = g_controllers[controllerIndex];
+	if (!controller.inUse || controller.slotIndex != slotIndex ||
+		controller.slotGeneration != (uint32_t)slot.generation) {
+		InterlockedExchange(&slot.controllerIndex, ProteusRouting::kUnboundController);
+		InterlockedIncrement(&slot.generation);
+		return;
+	}
+	XamUserBindDeviceCallback(0xa7553952 + controllerIndex,
+		kDeviceContextBase + controllerIndex, 0, true, 0);
+	InterlockedExchange(&slot.controllerIndex, ProteusRouting::kUnboundController);
+	InterlockedIncrement(&slot.generation);
+	DbgPrint("TritonDriver: interface %d unbound from controller %d, XAM user %d\n",
+		slotIndex + TritonProtocol::kFirstSlotInterface, controllerIndex, controller.userIndex);
+	ReleaseController(controllerIndex);
+}
+
+bool BindController(int slotIndex) {
+	ProteusRoutingSlot& slot = g_proteusSlots[slotIndex];
+	if (!slot.connected || slot.controllerIndex >= 0) return false;
+	int controllerIndex = ReserveController();
+	if (controllerIndex < 0) return false;
+	TritonVirtualController& controller = g_controllers[controllerIndex];
+	controller.deviceContext = kDeviceContextBase + controllerIndex;
+	controller.slotIndex = (uint8_t)slotIndex;
+	controller.slotGeneration = (uint32_t)InterlockedIncrement(&slot.generation);
+	// Generation zero is reserved for a disabled rumble mailbox.
+	if (!controller.slotGeneration)
+		controller.slotGeneration = (uint32_t)InterlockedIncrement(&slot.generation);
+	InterlockedExchange(&slot.controllerIndex, controllerIndex);
+	InterlockedExchange64(&g_rumbleRequests[slotIndex],
+		(LONG64)RumbleOutput::Request(controller.slotGeneration, 0, 0));
+	if (!slot.connected || slot.disconnectPending)
+		InterlockedExchange64(&g_rumbleRequests[slotIndex], 0);
+	MemoryBarrier();
+	uint8_t userIndex = 0xff;
+	int result = XamUserBindDeviceCallback(0xa7553952 + controllerIndex,
+		controller.deviceContext, 0, false, &userIndex);
+	if (!ProteusRouting::IsValidXamBinding(result, userIndex)) {
+		InterlockedExchange64(&g_rumbleRequests[slotIndex], 0);
+		DbgPrint("TritonDriver: interface %d bind failed for controller %d: %x user %d\n",
+			slotIndex + TritonProtocol::kFirstSlotInterface, controllerIndex, result, userIndex);
+		if (result == 0) XamUserBindDeviceCallback(0xa7553952 + controllerIndex,
+			controller.deviceContext, 0, true, 0);
+		InterlockedExchange(&slot.controllerIndex, ProteusRouting::kUnboundController);
+		InterlockedIncrement(&slot.generation);
+		ReleaseController(controllerIndex);
+		return false;
+	}
+	controller.userIndex = userIndex;
+	DbgPrint("TritonDriver: interface %d bound to controller %d, XAM user %d\n",
+		slotIndex + TritonProtocol::kFirstSlotInterface, controllerIndex, userIndex);
+	return true;
+}
+
+void ProcessProteusEvents() {
+	for (int i = 0; i < ProteusRouting::kSlotCount; ++i) {
+		LONG pending = InterlockedExchange(&g_proteusSlots[i].disconnectPending, 0);
+		if ((pending || !g_proteusSlots[i].connected) && g_proteusSlots[i].controllerIndex >= 0)
+			UnbindController(i);
+	}
+	for (int i = 0; i < ProteusRouting::kSlotCount; ++i)
+		if (g_proteusSlots[i].connected && g_proteusSlots[i].controllerIndex < 0)
+			BindController(i);
+}
+
+DWORD WINAPI ProteusServiceThreadProc(void*) {
+	if (g_abortServiceStartup) return ERROR_NOT_ENOUGH_MEMORY;
+	if (GetCurrentProcessorNumber() != kUsbProcessor) {
+		DbgPrint("TritonDriver: USB service affinity incorrect; refusing unsafe USB maintenance\n");
+		return ERROR_INVALID_FUNCTION;
+	}
+	DbgPrint("TritonDriver: USB maintenance on hardware thread %d at IRQL %d\n",
+		kUsbProcessor, kUsbDispatchLevel);
+	for (;;) {
+		DWORD now = GetTickCount();
+		// Run on the USB processor with its completion DPCs excluded. Submitting
+		// from CPU 4 / passive level races the kernel's USB transfer free lists;
+		// per-slot inputPending/controlBusy flags cannot protect those lists.
+		BYTE previousIrql = KfRaiseIrql(kUsbDispatchLevel);
+		ProteusMaintenance(now);
+		KfLowerIrql(previousIrql);
+		Sleep(RumbleOutput::kServiceMs);
+	}
+}
+
+DWORD WINAPI ProteusBindingThreadProc(void*) {
+	for (;;) {
+		// Binding can block in XAM. Keep it off the rumble refresh worker.
+		ProcessProteusEvents();
+		Sleep(100);
+	}
+}
+
+TritonVirtualController* FindControllerByUser(DWORD user) {
+	for (int i = 0; i < kControllerCount; ++i)
+		if (g_controllers[i].inUse && g_controllers[i].userIndex == user) return &g_controllers[i];
+	return 0;
+}
+
+TritonVirtualController* FindControllerByContext(DWORD context, int* index) {
+	for (int i = 0; i < kControllerCount; ++i) {
+		if (g_controllers[i].inUse && g_controllers[i].deviceContext == context) {
+			if (index) *index = i;
+			return &g_controllers[i];
+		}
+>>>>>>> Stashed changes
 	}
 	return 0;
 }
@@ -389,6 +608,7 @@ void SendInterruptRequest(
 	UsbdQueueAsyncTransfer(deviceHandle, interruptTrb);
 }
 
+<<<<<<< Updated upstream
 int32_t noopCompleteHandler(DWORD deviceHandle, int32_t status) {
 	return 0;
 }
@@ -1329,6 +1549,53 @@ DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_STATE* pInputState, B
 
 DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_CAPABILITIES_EX* capabilities) {
 	DWORD status = XamInputGetCapabilitiesDetour.GetOriginal<decltype(&XamInputGetCapabilitiesExHook)>()(unk, user, flags, capabilities);
+=======
+DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_VIBRATION* vibration) {
+	DWORD status = g_xamInputSetStateDetour.GetOriginal<decltype(&XamInputSetStateHook)>()(
+		user, flags, vibration);
+	if ((user & 0xff) == 0xff) user = 0;
+	TritonVirtualController* controller = FindControllerByUser(user);
+	if (status != ERROR_DEVICE_NOT_CONNECTED || !controller) return status;
+	if (!vibration) return ERROR_INVALID_PARAMETER;
+	int slotIndex = controller->slotIndex;
+	uint32_t generation = controller->slotGeneration;
+	if (!ProteusRouting::IsValidSlotIndex(slotIndex)) return ERROR_DEVICE_NOT_CONNECTED;
+	ProteusRoutingSlot& slot = g_proteusSlots[slotIndex];
+	int controllerIndex = (int)(controller - g_controllers);
+	if (slot.disconnectPending || !ProteusRouting::AssociationMatches(
+		slot.connected != 0, slot.controllerIndex, (uint32_t)slot.generation,
+		controller->inUse != 0, slotIndex, generation, controllerIndex) ||
+		controller->userIndex != user) return ERROR_DEVICE_NOT_CONNECTED;
+	LONG64 desired = (LONG64)RumbleOutput::Request(generation,
+		vibration->wLeftMotorSpeed, vibration->wRightMotorSpeed);
+	for (int attempt = 0; attempt < 8; ++attempt) {
+		LONG64 previous = InterlockedCompareExchange64(&g_rumbleRequests[slotIndex], 0, 0);
+		if (!generation || RumbleOutput::Generation((uint64_t)previous) != generation)
+			return ERROR_DEVICE_NOT_CONNECTED;
+		if (InterlockedCompareExchange64(&g_rumbleRequests[slotIndex], desired, previous) == previous)
+			return ERROR_SUCCESS;
+	}
+	return ERROR_BUSY;
+}
+
+DWORD XamInputGetCapabilitiesHook(DWORD unknown, DWORD user, DWORD flags,
+	PXINPUT_CAPABILITIES_EX capabilities) {
+	DWORD status = g_xamInputGetCapabilitiesDetour.GetOriginal<decltype(&XamInputGetCapabilitiesHook)>()(
+		unknown, user, flags, capabilities);
+	if ((user & 0xff) == 0xff) user = 0;
+	if (!capabilities || status != ERROR_DEVICE_NOT_CONNECTED || !FindControllerByUser(user)) return status;
+	capabilities->Type = XINPUT_DEVTYPE_GAMEPAD;
+	capabilities->SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+	capabilities->Flags = XINPUT_CAPS_FFB_SUPPORTED | XINPUT_CAPS_WIRELESS;
+	XINPUT_STATE state;
+	memset(&state, 0, sizeof(state));
+	XInputGetState(user, &state);
+	capabilities->Gamepad = state.Gamepad;
+	capabilities->Vibration.wLeftMotorSpeed = 0xffff;
+	capabilities->Vibration.wRightMotorSpeed = 0xffff;
+	return ERROR_SUCCESS;
+}
+>>>>>>> Stashed changes
 
 	if ((user & 0xFF) == 0xFF)
 		user = 0;
@@ -1561,6 +1828,7 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 			return FALSE;
 		}
 
+<<<<<<< Updated upstream
 		DbgPrint("EINTIM: HELLO from xbox 360 HID controller driver version 0.6 beta\n");
 		if (!initFunctionPointers())
 			return FALSE;
@@ -1605,5 +1873,71 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		// Start mapping manager thread
 		MakeThread((LPTHREAD_START_ROUTINE)MappingManagerThreadProc, nullptr);
 	}
+=======
+void ProteusDisconnectController(uint8_t interfaceNumber) {
+	if (interfaceNumber < TritonProtocol::kFirstSlotInterface ||
+		interfaceNumber > TritonProtocol::kLastSlotInterface) return;
+	ProteusRoutingSlot& slot = g_proteusSlots[interfaceNumber - TritonProtocol::kFirstSlotInterface];
+	InterlockedExchange64(&g_rumbleRequests[interfaceNumber - TritonProtocol::kFirstSlotInterface], 0);
+	InterlockedExchange(&slot.connected, 0);
+	InterlockedExchange(&slot.disconnectPending, 1);
+}
+
+uint64_t ProteusReadRumbleRequest(uint8_t interfaceNumber) {
+	int index = interfaceNumber - TritonProtocol::kFirstSlotInterface;
+	if (!ProteusRouting::IsValidSlotIndex(index)) return 0;
+	ProteusRoutingSlot& slot = g_proteusSlots[index];
+	uint64_t request = (uint64_t)InterlockedCompareExchange64(&g_rumbleRequests[index], 0, 0);
+	if (!slot.connected || slot.disconnectPending || slot.controllerIndex < 0 ||
+		RumbleOutput::Generation(request) != (uint32_t)slot.generation) return 0;
+	return request;
+}
+
+BOOL APIENTRY DllMain(HANDLE, DWORD reason, PVOID) {
+	if (reason != DLL_PROCESS_ATTACH) return TRUE;
+	if ((XboxKrnlVersion->Build != 17559 && XboxKrnlVersion->Build != 17489) || IsTrayOpen()) {
+		DbgPrint("TritonDriver: unsupported dashboard or disc tray open; aborting\n");
+		return FALSE;
+	}
+	DbgPrint("TritonDriver: starting Triton-over-Proteus driver\n");
+	if (!InitializeFunctionPointers()) return FALSE;
+	InitializeRouting();
+	// Fail before installing hooks if the worker cannot be created. Returning
+	// FALSE with live hooks would leave kernel calls targeting an unloaded DLL.
+	HANDLE serviceThread = MakeSystemThread(ProteusServiceThreadProc, 0);
+	if (!serviceThread) return FALSE;
+	HANDLE bindingThread = MakeSystemThread(ProteusBindingThreadProc, 0);
+	if (!bindingThread) {
+		// No hooks are installed, and the USB worker has never been resumed.
+		InterlockedExchange(&g_abortServiceStartup, 1);
+		ResumeThread(serviceThread);
+		WaitForSingleObject(serviceThread, INFINITE);
+		CloseHandle(serviceThread);
+		return FALSE;
+	}
+	XSetThreadProcessor(bindingThread, 4);
+	if (g_isDevkit) {
+		g_hidAddDeviceDetour = Detour((void*)0x8011AE38, (void*)HidAddDeviceHook);
+		g_hidRemoveDeviceDetour = Detour((void*)0x8011ADF8, (void*)HidRemoveDeviceHook);
+	} else {
+		g_hidAddDeviceDetour = Detour((void*)0x800E4D68, (void*)HidAddDeviceHook);
+		g_hidRemoveDeviceDetour = Detour((void*)0x800E4D28, (void*)HidRemoveDeviceHook);
+	}
+	g_hidAddDeviceDetour.Install();
+	g_hidRemoveDeviceDetour.Install();
+	g_xamInputGetCapabilitiesDetour = Detour(g_xamInputGetCapabilities, (void*)XamInputGetCapabilitiesHook);
+	g_xamInputSetStateDetour = Detour(g_xamInputSetState, (void*)XamInputSetStateHook);
+	g_xinputReadStateDetour = Detour(g_xinputReadState, (void*)XInputdReadStateHook);
+	g_xamInputSetStateDetour.Install();
+	g_xamInputGetCapabilitiesDetour.Install();
+	g_xinputReadStateDetour.Install();
+	g_usbdPowerDownNotification();
+	g_freePhysicalMemory(0, *(DWORD*)g_usbPhysicalPage);
+	g_usbdDriverEntry();
+	ResumeThread(serviceThread);
+	ResumeThread(bindingThread);
+	CloseHandle(serviceThread);
+	CloseHandle(bindingThread);
+>>>>>>> Stashed changes
 	return TRUE;
 }

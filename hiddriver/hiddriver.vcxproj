@@ -90,8 +90,16 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="Detours.h" />
+<<<<<<< Updated upstream:hiddriver/hiddriver.vcxproj
     <ClInclude Include="hid_parser.h" />
     <ClInclude Include="mapping.h" />
+=======
+    <ClInclude Include="driver_types.h" />
+    <ClInclude Include="proteus.h" />
+    <ClInclude Include="proteus_routing.h" />
+    <ClInclude Include="rumble_output.h" />
+    <ClInclude Include="triton_protocol.h" />
+>>>>>>> Stashed changes:hiddriver/tritondriver.vcxproj
     <ClInclude Include="usb.h" />
   </ItemGroup>
   <ItemGroup>

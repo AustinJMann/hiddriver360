@@ -8,9 +8,15 @@ Experimental on-console HID driver focussing on providing third party, non xinpu
 - Controllers are registered inside xam and therefore fully recognized in the entire xbox 360 user interface, ring of light will update accordingly, no original controllers are needed etc
 - The controller works in all tested games
 
+Experimental two-channel rumble forwards Xbox motor strengths to the Triton
+using HID output reports. Active rumble is refreshed automatically, and pending
+requests are discarded on disconnect or rebinding. This output path has not yet
+been validated on console hardware; see [rumble validation](docs/rumble-validation.md).
+
 ## Current limitations
 - no rumble support
 
+<<<<<<< Updated upstream
 ## Supported controllers
 - DualShock 4 (PS4 controller)
 - DualShock 4 Wireless Adapter (CUH-ZWA1E)
@@ -19,6 +25,12 @@ Experimental on-console HID driver focussing on providing third party, non xinpu
 - DualShock 3
 - Nintendo Switch Pro controller
 - Any USB HID compliant controller thanks to built in mapping assistant :) (this excludes modern xbox controllers like xbox one and xbox series because microsoft made them GIP only)
+=======
+- Triton-over-Proteus only; direct USB, Bluetooth, and BLE are unsupported.
+- One Proteus puck, with up to four paired controllers.
+- Rumble is experimental; no touch or IMU input.
+- Four simultaneous physical Tritons have not yet been hardware-validated.
+>>>>>>> Stashed changes
 
 ## How to use
 1. load plugin (either at runtime or at boot via your launch.ini)
@@ -36,6 +48,20 @@ Experimental on-console HID driver focussing on providing third party, non xinpu
 ## Showcase
 https://github.com/user-attachments/assets/f090e5f4-538d-457f-8189-2c5b98579984
 
+<<<<<<< Updated upstream
+=======
+Host protocol, rumble scheduling, USB descriptor, and routing tests are in
+`tests/triton_protocol_tests.vcxproj`. Run them from a Visual Studio 2022
+Developer PowerShell prompt with the desktop C++ tools installed:
+
+```powershell
+msbuild tests\triton_protocol_tests.vcxproj /p:Configuration=Release /p:Platform=x64
+if ($LASTEXITCODE -eq 0) { & .\tests\x64\Release\triton_protocol_tests.exe }
+```
+
+The executable exits with code 0 when all checks pass. These host tests do not
+exercise the Xbox USB stack or replace testing with a physical puck.
+>>>>>>> Stashed changes
 
 ## Attributions
 - [EinTim23](https://github.com/EinTim23/) for Reverse engineering the xbox 360s HID and controller implementation and implementing this driver
