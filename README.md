@@ -3,6 +3,10 @@
 TritonDriver is an Xbox 360 system plugin for Steam Controller 2026 (Triton)
 controllers connected through a Valve Proteus wireless puck (`28DE:1304`).
 
+```diff
+! AI was heavily utilized in the creation of this driver.
+```
+
 ## Requirements
 
 - A modded Xbox 360 capable of loading XEX plugins.
