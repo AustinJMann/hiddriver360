@@ -1,8 +1,13 @@
+// These checks must run even when the host project defines NDEBUG.
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <assert.h>
 #include <string.h>
 
 #include "../hiddriver/triton_protocol.h"
 #include "../hiddriver/proteus_routing.h"
+#include "../hiddriver/usb_descriptors.h"
 
 using namespace TritonProtocol;
 
@@ -99,6 +104,73 @@ struct RoutingSimulation {
 static void Put16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void Put32(uint8_t* p, uint32_t v) {
 	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+static void TestUsbDescriptors() {
+	const uint8_t configuration[] = {
+		9, 2, 57, 0, 2, 1, 0, 0x80, 50,
+		9, 4, 2, 0, 1, 3, 0, 0, 0,
+		7, 5, 0x82, 3, 64, 0, 1,
+		9, 4, 2, 1, 1, 3, 0, 0, 0,
+		7, 5, 0x86, 3, 32, 0, 2,
+		9, 4, 3, 0, 1, 3, 0, 0, 0,
+		7, 5, 0x83, 3, 64, 0, 1
+	};
+	usb_endpoint_descriptor endpoint = {};
+	assert(UsbDescriptors::FindInterruptInEndpoint(configuration, sizeof(configuration), 2, &endpoint));
+	assert(endpoint.bEndpointAddress == 0x82);
+	assert(ReadLE16((const uint8_t*)&endpoint.wMaxPacketSize) == 64);
+	assert(endpoint.bInterval == 1);
+	assert(UsbDescriptors::FindInterruptInEndpoint(configuration, sizeof(configuration), 3, &endpoint));
+	assert(endpoint.bEndpointAddress == 0x83);
+	assert(!UsbDescriptors::FindInterruptInEndpoint(configuration, sizeof(configuration), 4, &endpoint));
+	assert(endpoint.bEndpointAddress == 0x83);
+	assert(!UsbDescriptors::FindInterruptInEndpoint(0, sizeof(configuration), 2, &endpoint));
+	assert(!UsbDescriptors::FindInterruptInEndpoint(configuration, sizeof(configuration), 2, 0));
+	for (size_t length = 0; length < sizeof(configuration); ++length) {
+		assert(!UsbDescriptors::FindInterruptInEndpoint(configuration, length, 2, &endpoint));
+		assert(endpoint.bEndpointAddress == 0x83);
+	}
+
+	uint8_t malformed[sizeof(configuration)];
+	// Invalid lengths at each descriptor boundary, including after a match.
+	const size_t offsets[] = { 9, 18, 25, 34, 41, 50 };
+	const uint8_t lengths[] = { 0, 1, 6, 255 };
+	for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
+		for (size_t j = 0; j < sizeof(lengths); ++j) {
+			memcpy(malformed, configuration, sizeof(configuration));
+			malformed[offsets[i]] = lengths[j];
+			assert(!UsbDescriptors::FindInterruptInEndpoint(malformed, sizeof(malformed), 2, &endpoint));
+			assert(endpoint.bEndpointAddress == 0x83);
+		}
+	}
+	memcpy(malformed, configuration, sizeof(configuration));
+	malformed[0] = 8;
+	assert(!UsbDescriptors::FindInterruptInEndpoint(malformed, sizeof(malformed), 2, &endpoint));
+	memcpy(malformed, configuration, sizeof(configuration));
+	malformed[1] = 1;
+	assert(!UsbDescriptors::FindInterruptInEndpoint(malformed, sizeof(malformed), 2, &endpoint));
+	memcpy(malformed, configuration, sizeof(configuration));
+	malformed[2] = 8;
+	assert(!UsbDescriptors::FindInterruptInEndpoint(malformed, sizeof(malformed), 2, &endpoint));
+	memcpy(malformed, configuration, sizeof(configuration));
+	malformed[2] = 26; // A dangling byte after the first complete endpoint.
+	assert(!UsbDescriptors::FindInterruptInEndpoint(malformed, sizeof(malformed), 2, &endpoint));
+
+	// An endpoint must belong to the default HID interface and be interrupt-IN.
+	const size_t invalidOffsets[] = { 12, 14, 15, 16, 20, 20, 21 };
+	const uint8_t invalidValues[] = { 1, 2, 1, 1, 0x02, 0x80, 2 };
+	for (size_t i = 0; i < sizeof(invalidOffsets) / sizeof(invalidOffsets[0]); ++i) {
+		memcpy(malformed, configuration, sizeof(configuration));
+		malformed[invalidOffsets[i]] = invalidValues[i];
+		assert(!UsbDescriptors::FindInterruptInEndpoint(malformed, sizeof(malformed), 2, &endpoint));
+		assert(endpoint.bEndpointAddress == 0x83);
+	}
+	endpoint.bDescriptorType = 4;
+	assert(!UsbDescriptors::IsInterruptInEndpoint(endpoint));
+	endpoint.bDescriptorType = 5;
+	endpoint.bLength = 6;
+	assert(!UsbDescriptors::IsInterruptInEndpoint(endpoint));
 }
 
 static void TestAdmissionAndValidation() {
@@ -329,6 +401,7 @@ static void TestRoutingRemovalOrdersAndGuideDebounce() {
 }
 
 int main() {
+	TestUsbDescriptors();
 	TestAdmissionAndValidation();
 	TestStateIdsAndAxes();
 	TestButtonsAndTriggers();

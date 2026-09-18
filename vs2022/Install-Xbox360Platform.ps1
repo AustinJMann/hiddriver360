@@ -169,7 +169,7 @@ try {
     if ($missing) { throw ('Missing files after install: ' + ($missing -join '; ')) }
 
     Log 'SUCCESS: Xbox 360 platform registered with VS2022.'
-    Log 'You can now open hiddriver.sln in Visual Studio 2022 and build.'
+    Log 'You can now open TritonDriver.sln in Visual Studio 2022 and build.'
     if (-not $NoPause) { [void](Read-Host 'Press Enter to close') }
     exit 0
 }

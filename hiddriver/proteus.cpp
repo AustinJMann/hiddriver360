@@ -5,6 +5,7 @@
 
 #include "proteus.h"
 #include "triton_protocol.h"
+#include "usb_descriptors.h"
 
 typedef usb_endpoint_descriptor* (*EndpointDescriptorFn)(deviceHandle*, int, int, int);
 typedef int (*AddCompleteFn)(deviceHandle*, int);
@@ -189,59 +190,17 @@ static ProteusSlot* FindSlotByControlTrb(void* trb) {
 
 static void ParseConfigurationDescriptor() {
 	memset(g_slotEndpointDescriptors, 0, sizeof(g_slotEndpointDescriptors));
-	uint16_t totalLength = TritonProtocol::ReadLE16(g_configurationDescriptor + 2);
-	if (totalLength > kConfigurationDescriptorBufferSize)
-		totalLength = kConfigurationDescriptorBufferSize;
-	uint8_t currentInterface = 0xff;
-	uint16_t offset = 0;
-	while (offset + 2 <= totalLength) {
-		uint8_t length = g_configurationDescriptor[offset];
-		uint8_t type = g_configurationDescriptor[offset + 1];
-		if (length < 2 || offset + length > totalLength) break;
-		if (type == 0x04 && length >= sizeof(usb_interface_descriptor)) {
-			const usb_interface_descriptor* descriptor =
-				(const usb_interface_descriptor*)(g_configurationDescriptor + offset);
-			currentInterface = descriptor->bInterfaceNumber;
-		} else if (type == 0x05 && length >= 7 &&
-			currentInterface >= TritonProtocol::kFirstSlotInterface &&
-			currentInterface <= TritonProtocol::kLastSlotInterface) {
-			const usb_endpoint_descriptor* endpoint =
-				(const usb_endpoint_descriptor*)(g_configurationDescriptor + offset);
-			if ((endpoint->bEndpointAddress & 0x80) && (endpoint->bmAttributes & 3) == 3) {
-				int slotIndex = currentInterface - TritonProtocol::kFirstSlotInterface;
-				memset(&g_slotEndpointDescriptors[slotIndex], 0, sizeof(g_slotEndpointDescriptors[slotIndex]));
-				memcpy(&g_slotEndpointDescriptors[slotIndex], endpoint, 7);
-				DbgPrint("TritonDriver: Proteus configuration maps interface %d to endpoint %02x size %d interval %d\n",
-					currentInterface, endpoint->bEndpointAddress,
-					TritonProtocol::ReadLE16((const uint8_t*)&endpoint->wMaxPacketSize),
-					endpoint->bInterval);
-			}
+	for (int i = 0; i < kSlotCount; ++i) {
+		uint8_t interfaceNumber = (uint8_t)(TritonProtocol::kFirstSlotInterface + i);
+		usb_endpoint_descriptor* endpoint = &g_slotEndpointDescriptors[i];
+		if (UsbDescriptors::FindInterruptInEndpoint(g_configurationDescriptor,
+			sizeof(g_configurationDescriptor), interfaceNumber, endpoint)) {
+			DbgPrint("TritonDriver: Proteus configuration maps interface %d to endpoint %02x size %d interval %d\n",
+				interfaceNumber, endpoint->bEndpointAddress,
+				TritonProtocol::ReadLE16((const uint8_t*)&endpoint->wMaxPacketSize),
+				endpoint->bInterval);
 		}
-		offset += length;
 	}
-}
-
-static usb_endpoint_descriptor* ScanInterfaceInterruptInEndpoint(
-	const usb_interface_descriptor* interfaceDescriptor, usb_endpoint_descriptor* copy) {
-	if (!interfaceDescriptor || !copy) return 0;
-	const uint8_t* cursor = (const uint8_t*)interfaceDescriptor + interfaceDescriptor->bLength;
-	const uint8_t* limit = cursor + 96;
-	while (cursor + 2 <= limit) {
-		uint8_t length = cursor[0];
-		uint8_t type = cursor[1];
-		if (length < 2 || cursor + length > limit) break;
-		if (type == 0x04) break;
-		if (type == 0x05 && length >= 7) {
-			const usb_endpoint_descriptor* endpoint = (const usb_endpoint_descriptor*)cursor;
-			if ((endpoint->bEndpointAddress & 0x80) && (endpoint->bmAttributes & 0x03) == 0x03) {
-				memset(copy, 0, sizeof(*copy));
-				memcpy(copy, endpoint, 7);
-				return copy;
-			}
-		}
-		cursor += length;
-	}
-	return 0;
 }
 
 static bool StartListening(ProteusSlot* slot) {
@@ -253,18 +212,17 @@ static bool StartListening(ProteusSlot* slot) {
 		usb_endpoint_descriptor* indexed = UsbdGetEndpointDescriptor(
 			slot->handle, slot->interfaceNumber, 3, 1);
 		if (indexed) {
-			memcpy(&slot->endpointDescriptor, indexed, sizeof(slot->endpointDescriptor));
+			memcpy(&slot->endpointDescriptor, indexed, UsbDescriptors::kEndpointDescriptorSize);
 			DbgPrint("TritonDriver: Proteus interface %d indexed endpoint %02x descriptor %p\n",
 				slot->interfaceNumber, indexed->bEndpointAddress, indexed);
 		} else {
 			usb_endpoint_descriptor* fallback = UsbdGetEndpointDescriptor(slot->handle, 0, 3, 1);
-			if (fallback) memcpy(&slot->endpointDescriptor, fallback, sizeof(slot->endpointDescriptor));
+			if (fallback) memcpy(&slot->endpointDescriptor, fallback, UsbDescriptors::kEndpointDescriptorSize);
 			DbgPrint("TritonDriver: Proteus interface %d indexed lookup failed; fallback endpoint %02x\n",
 				slot->interfaceNumber, fallback ? fallback->bEndpointAddress : 0);
 		}
 	}
-	endpoint = &slot->endpointDescriptor;
-	if (!endpoint) {
+	if (!UsbDescriptors::IsInterruptInEndpoint(*endpoint)) {
 		DbgPrint("TritonDriver: Proteus interface %d has no interrupt-IN endpoint\n", slot->interfaceNumber);
 		return false;
 	}
@@ -273,11 +231,15 @@ static bool StartListening(ProteusSlot* slot) {
 		DbgPrint("TritonDriver: Proteus interface %d invalid packet size %d\n", slot->interfaceNumber, packetSize);
 		return false;
 	}
-	NTSTATUS result = UsbdOpenEndpoint(slot->handle, 3, endpoint->bEndpointAddress,
-		packetSize, endpoint->bInterval, (DWORD*)&slot->extension->interruptTrb);
-	if (NT_ERROR(result)) return false;
 	slot->inputBuffer = (uint8_t*)calloc(1, packetSize);
 	if (!slot->inputBuffer) return false;
+	NTSTATUS result = UsbdOpenEndpoint(slot->handle, 3, endpoint->bEndpointAddress,
+		packetSize, endpoint->bInterval, (DWORD*)&slot->extension->interruptTrb);
+	if (NT_ERROR(result)) {
+		free(slot->inputBuffer);
+		slot->inputBuffer = 0;
+		return false;
+	}
 	slot->inputLength = packetSize;
 	UsbTrb* inputTrb = &slot->extension->interruptTrb;
 	inputTrb->buffer = slot->inputBuffer;
@@ -518,15 +480,6 @@ int ProteusAddSlotInterface(deviceHandle* handle,
 	memset(slot, 0, sizeof(*slot));
 	slot->handle = handle;
 	slot->interfaceNumber = descriptor->bInterfaceNumber;
-	usb_endpoint_descriptor* interfaceEndpoint =
-		ScanInterfaceInterruptInEndpoint(descriptor, &slot->endpointDescriptor);
-	if (interfaceEndpoint) {
-		DbgPrint("TritonDriver: Proteus interface %d descriptor-local endpoint %02x\n",
-			slot->interfaceNumber, interfaceEndpoint->bEndpointAddress);
-	} else {
-		DbgPrint("TritonDriver: Proteus interface %d could not find descriptor-local endpoint; using kernel lookup\n",
-			slot->interfaceNumber);
-	}
 	slot->retryDelay = kHeartbeatRetryMs;
 	slot->extension = new ProteusControllerExtension();
 	if (!slot->extension) { memset(slot, 0, sizeof(*slot)); return -1; }

@@ -105,7 +105,6 @@ HANDLE MakeSystemThread(LPTHREAD_START_ROUTINE entry, PVOID argument) {
 	if (!thread) return 0;
 	XSetThreadProcessor(thread, kUsbProcessor);
 	SetThreadPriority(thread, THREAD_PRIORITY_NORMAL);
-	ResumeThread(thread);
 	return thread;
 }
 
@@ -216,7 +215,7 @@ void ProcessProteusEvents() {
 			BindController(i);
 }
 
-unsigned int __stdcall ProteusServiceThreadProc(void*) {
+DWORD WINAPI ProteusServiceThreadProc(void*) {
 	if (GetCurrentProcessorNumber() != kUsbProcessor) {
 		DbgPrint("TritonDriver: USB service affinity incorrect; refusing unsafe USB maintenance\n");
 		return ERROR_INVALID_FUNCTION;
@@ -426,6 +425,10 @@ BOOL APIENTRY DllMain(HANDLE, DWORD reason, PVOID) {
 	DbgPrint("TritonDriver: starting Triton-over-Proteus driver\n");
 	if (!InitializeFunctionPointers()) return FALSE;
 	InitializeRouting();
+	// Fail before installing hooks if the worker cannot be created. Returning
+	// FALSE with live hooks would leave kernel calls targeting an unloaded DLL.
+	HANDLE serviceThread = MakeSystemThread(ProteusServiceThreadProc, 0);
+	if (!serviceThread) return FALSE;
 	if (g_isDevkit) {
 		g_hidAddDeviceDetour = Detour((void*)0x8011AE38, (void*)HidAddDeviceHook);
 		g_hidRemoveDeviceDetour = Detour((void*)0x8011ADF8, (void*)HidRemoveDeviceHook);
@@ -444,8 +447,7 @@ BOOL APIENTRY DllMain(HANDLE, DWORD reason, PVOID) {
 	g_usbdPowerDownNotification();
 	g_freePhysicalMemory(0, *(DWORD*)g_usbPhysicalPage);
 	g_usbdDriverEntry();
-	HANDLE serviceThread = MakeSystemThread((LPTHREAD_START_ROUTINE)ProteusServiceThreadProc, 0);
-	if (!serviceThread) return FALSE;
+	ResumeThread(serviceThread);
 	CloseHandle(serviceThread);
 	return TRUE;
 }
