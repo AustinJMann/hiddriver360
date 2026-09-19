@@ -4,10 +4,13 @@
 #endif
 #include <assert.h>
 #include <string.h>
+#include <Windows.h>
+#include <Xinput.h>
+#include "../hiddriver/controller_capabilities.h"
+#include "../hiddriver/rumble_output.h"
 
 #include "../hiddriver/triton_protocol.h"
 #include "../hiddriver/proteus_routing.h"
-#include "../hiddriver/rumble_output.h"
 #include "../hiddriver/usb_descriptors.h"
 
 using namespace TritonProtocol;
@@ -401,6 +404,54 @@ static void TestRoutingRemovalOrdersAndGuideDebounce() {
 	assert(ProteusRouting::GuidePressIsDue(0xfffffff0u, 0x000003e0u, 1000));
 }
 
+static void TestControllerCapabilities() {
+	struct GuardedCapabilities {
+		XINPUT_CAPABILITIES caps;
+		uint32_t guard;
+	} output;
+	memset(&output, 0xa5, sizeof(output));
+	ControllerCapabilities::Fill(&output.caps);
+	assert(output.guard == 0xa5a5a5a5u);
+	assert(output.caps.Type == XINPUT_DEVTYPE_GAMEPAD);
+	assert(output.caps.SubType == XINPUT_DEVSUBTYPE_GAMEPAD);
+	assert(output.caps.Flags == 0x0003); // Xbox 360 force feedback + wireless flags.
+	assert(output.caps.Gamepad.wButtons == (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B |
+		XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_Y | XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK |
+		XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB |
+		XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER |
+		XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN |
+		XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT));
+	assert(output.caps.Gamepad.bLeftTrigger == 255 && output.caps.Gamepad.bRightTrigger == 255);
+	assert(output.caps.Gamepad.sThumbLX == 32767 && output.caps.Gamepad.sThumbLY == 32767);
+	assert(output.caps.Gamepad.sThumbRX == 32767 && output.caps.Gamepad.sThumbRY == 32767);
+	assert(output.caps.Vibration.wLeftMotorSpeed == 0xffff && output.caps.Vibration.wRightMotorSpeed == 0xffff);
+	XINPUT_CAPABILITIES expected = output.caps;
+	memset(&output.caps, 0xff, sizeof(output.caps));
+	ControllerCapabilities::Fill(&output.caps);
+	assert(memcmp(&expected, &output.caps, sizeof(expected)) == 0);
+	struct ExtendedCapabilities : XINPUT_CAPABILITIES {
+		uint32_t reserved[3];
+	};
+	struct GuardedExtendedCapabilities {
+		ExtendedCapabilities caps;
+		uint32_t guard;
+	} extended;
+	memset(&extended, 0xa5, sizeof(extended));
+	ControllerCapabilities::Fill(&extended.caps);
+	assert(extended.guard == 0xa5a5a5a5u);
+	assert(memcmp(&expected, static_cast<XINPUT_CAPABILITIES*>(&extended.caps), sizeof(expected)) == 0);
+	for (int i = 0; i < 3; ++i) assert(extended.caps.reserved[i] == 0);
+	assert(ControllerCapabilities::AcceptsGamepad(0));
+	assert(ControllerCapabilities::AcceptsGamepad(1));
+	assert(!ControllerCapabilities::AcceptsGamepad(2));
+	assert(ControllerCapabilities::AcceptsGamepad(0x40000001));
+	assert(ControllerCapabilities::AnyUser(0xff, 0));
+	assert(ControllerCapabilities::AnyUser(0xffffffffu, 0));
+	assert(ControllerCapabilities::AnyUser(2, 0x40000000));
+	assert(!ControllerCapabilities::AnyUser(0x1ff, 0));
+	assert(!ControllerCapabilities::AnyUser(4, 0));
+}
+
 static void TestRumbleEncoding() {
 	uint8_t report[kRumbleReportSize + 2];
 	memset(report, 0xcc, sizeof(report));
@@ -509,6 +560,7 @@ static void TestRumbleWrapAndSlotIsolation() {
 }
 
 int main() {
+	TestControllerCapabilities();
 	TestRumbleEncoding();
 	TestRumbleRefreshAndCoalescing();
 	TestRumbleFailureAndReconnect();

@@ -1,56 +1,65 @@
-# HidDriver 360
-Experimental on-console HID driver focussing on providing third party, non xinput controller support to the xbox 360 without dongles.
+# TritonDriver
 
-## What works
-- Supports both 17559 retail and 17489 devkit dashboards
-- Reading controller input via USB
-- Up to 4 concurrent controllers, in combination with original xbox 360 controllers or without them
-- Controllers are registered inside xam and therefore fully recognized in the entire xbox 360 user interface, ring of light will update accordingly, no original controllers are needed etc
-- The controller works in all tested games
+TritonDriver is an Xbox 360 system plugin for Steam Controller 2026 (Triton)
+controllers connected through a Valve Proteus wireless puck (`28DE:1304`).
 
-Experimental two-channel rumble forwards Xbox motor strengths to the Triton
-using HID output reports. Active rumble is refreshed automatically, and pending
-requests are discarded on disconnect or rebinding. This output path has not yet
-been validated on console hardware; see [rumble validation](docs/rumble-validation.md).
+```diff
+! AI was heavily utilized in the creation of this driver.
+```
+
+## Requirements
+
+- A modded Xbox 360 capable of loading XEX plugins.
+- One Valve Proteus wireless puck.
+- One to four Triton controllers already paired.
+
+TritonDriver does not manage pairing. Pair the controllers before connecting
+the puck to the console.
+
+## Installation and use
+
+1. Copy `tritondriver.xex` to the console.
+2. Load it at runtime or add it to the plugin list in `launch.ini`.
+3. Connect the Proteus puck and power on the paired Triton controllers.
+
+Proteus interfaces 2 through 5 correspond to four independent wireless slots.
+Each connected Triton is registered as a virtual Xbox 360 controller when an
+XAM player position is available. A connected slot that cannot bind immediately
+is retried automatically. Disconnects, reconnects, controller power cycles, and
+slot rebinding are handled by the background Proteus service.
+
+Supported input includes face buttons, D-pad, shoulders, stick clicks, menu and
+view, both sticks, analog triggers, and the guide button. The driver periodically
+suppresses the firmware keyboard/mouse fallback while a controller is active.
+
+Rumble forwards each virtual controller's left/right motor strengths to its
+Proteus slot, with periodic refresh, coalescing, and retry handling. See the
+[rumble validation guide](docs/rumble-validation.md) for transport details and
+the hardware acceptance checklist.
 
 ## Current limitations
-- no rumble support
 
-<<<<<<< Updated upstream
-## Supported controllers
-- DualShock 4 (PS4 controller)
-- DualShock 4 Wireless Adapter (CUH-ZWA1E)
-- DualSense (PS5 controller)
-- DualSense Edge
-- DualShock 3
-- Nintendo Switch Pro controller
-- Any USB HID compliant controller thanks to built in mapping assistant :) (this excludes modern xbox controllers like xbox one and xbox series because microsoft made them GIP only)
-=======
 - Triton-over-Proteus only; direct USB, Bluetooth, and BLE are unsupported.
 - One Proteus puck, with up to four paired controllers.
-- Rumble is experimental; no touch or IMU input.
+- Experimental rumble over Proteus; console validation is still required.
+- No touch or IMU input.
 - Four simultaneous physical Tritons have not yet been hardware-validated.
->>>>>>> Stashed changes
 
-## How to use
-1. load plugin (either at runtime or at boot via your launch.ini)
-2. Connect controllers via USB
-3. Controllers with a built in mapping will start working right away, for all other controllers that are USB HID compliant a mapping assistant will be started that guides you through the process of mapping your controller
-4. enjoy :)
+Other HID devices and non-slot Proteus interfaces are delegated to the Xbox 360
+USB stack and are not claimed by TritonDriver.
 
-## How to build
-1. Acquire the official Xbox 360 SDK using black magic
-2. Install visual studio 2010 ultimate and visual studio 2019
-3. Install the sdk using the "FULL" preset
-4. Open the solution in visual studio 2019 and build
-5. Hopefully enjoy :)
+## Building
 
-## Showcase
-https://github.com/user-attachments/assets/f090e5f4-538d-457f-8189-2c5b98579984
+1. Install the official Xbox 360 SDK with the full feature set, Visual Studio
+   2010 Ultimate, and Visual Studio 2022.
+2. Run `vs2022\Install-Xbox360Platform.ps1` from an elevated PowerShell prompt.
+   If automatic detection fails, pass `-VsPath` with the Visual Studio path.
+3. Open `TritonDriver.sln` in Visual Studio 2022 and decline upgrade or retarget
+   prompts. The project must retain the `2010-01` Xbox 360 toolset.
+4. Build `Release Retail|Xbox 360`. The deployable output is
+   `tritondriver.xex`.
 
-<<<<<<< Updated upstream
-=======
-Host protocol, rumble scheduling, USB descriptor, and routing tests are in
+Host protocol, USB descriptor, and routing tests are in
 `tests/triton_protocol_tests.vcxproj`. Run them from a Visual Studio 2022
 Developer PowerShell prompt with the desktop C++ tools installed:
 
@@ -61,11 +70,12 @@ if ($LASTEXITCODE -eq 0) { & .\tests\x64\Release\triton_protocol_tests.exe }
 
 The executable exits with code 0 when all checks pass. These host tests do not
 exercise the Xbox USB stack or replace testing with a physical puck.
->>>>>>> Stashed changes
 
 ## Attributions
-- [EinTim23](https://github.com/EinTim23/) for Reverse engineering the xbox 360s HID and controller implementation and implementing this driver
-- [localcc](https://github.com/localcc/) for providing help about low level USB related questions and beaming the idea of doing this into my head
-- [Rapidjson](https://github.com/Tencent/rapidjson/) JSON library used to save/load user defined mappings
-- [Lufa](https://github.com/abcminiuser/lufa) HID report descriptor parser implementation used in hiddriver360 is derived from their implementation
-- [iMoD1998](https://github.com/iMoD1998) Creating the Detours library used in hiddriver360
+
+- [EinTim23](https://github.com/EinTim23/) for the original Xbox 360 USB and
+  virtual-controller driver work.
+- [localcc](https://github.com/localcc/) for low-level USB assistance.
+- [SDL](https://github.com/libsdl-org/SDL/blob/main/src/joystick/hidapi/SDL_hidapi_steam_triton.c)
+  for the public Triton HID protocol reference.
+- [iMoD1998](https://github.com/iMoD1998) for the retained Detours library.

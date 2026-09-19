@@ -3,24 +3,20 @@
   <ItemGroup>
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Detours.cpp" />
-    <ClCompile Include="hid_parser.cpp" />
-    <ClCompile Include="mapping.cpp" />
+    <ClCompile Include="proteus.cpp" />
+    <ClCompile Include="triton_protocol.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="xex.xml" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Detours.h" />
-<<<<<<< Updated upstream:hiddriver/hiddriver.vcxproj.filters
-    <ClInclude Include="hid_parser.h" />
-    <ClInclude Include="mapping.h" />
-=======
     <ClInclude Include="driver_types.h" />
     <ClInclude Include="proteus.h" />
     <ClInclude Include="proteus_routing.h" />
     <ClInclude Include="rumble_output.h" />
     <ClInclude Include="triton_protocol.h" />
->>>>>>> Stashed changes:hiddriver/tritondriver.vcxproj.filters
     <ClInclude Include="usb.h" />
+    <ClInclude Include="usb_descriptors.h" />
   </ItemGroup>
 </Project>

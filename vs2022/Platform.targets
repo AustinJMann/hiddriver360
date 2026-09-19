@@ -1,0 +1,4 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- VS2022 bridge: forward to the Xbox 360 XDK platform targets (v4.0-style name) -->
+  <Import Project="$(MSBuildThisFileDirectory)Microsoft.Cpp.Xbox 360.targets"/>
+</Project>
