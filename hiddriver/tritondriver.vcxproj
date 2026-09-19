@@ -91,6 +91,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="Detours.h" />
+    <ClInclude Include="controller_capabilities.h" />
     <ClInclude Include="driver_types.h" />
     <ClInclude Include="proteus.h" />
     <ClInclude Include="proteus_routing.h" />
