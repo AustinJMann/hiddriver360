@@ -53,7 +53,17 @@ USB stack and are not claimed by TritonDriver.
 4. Build `Release Retail|Xbox 360`. The deployable output is
    `tritondriver.xex`.
 
-Host protocol and routing tests are in `tests/triton_protocol_tests.vcxproj`.
+Host protocol, USB descriptor, and routing tests are in
+`tests/triton_protocol_tests.vcxproj`. Run them from a Visual Studio 2022
+Developer PowerShell prompt with the desktop C++ tools installed:
+
+```powershell
+msbuild tests\triton_protocol_tests.vcxproj /p:Configuration=Release /p:Platform=x64
+if ($LASTEXITCODE -eq 0) { & .\tests\x64\Release\triton_protocol_tests.exe }
+```
+
+The executable exits with code 0 when all checks pass. These host tests do not
+exercise the Xbox USB stack or replace testing with a physical puck.
 
 ## Attributions
 

@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "Detours.h"
+#include "controller_capabilities.h"
 #include "driver_types.h"
 #include "proteus.h"
 #include "proteus_routing.h"
@@ -21,6 +22,7 @@ Detour g_hidAddDeviceDetour;
 Detour g_hidRemoveDeviceDetour;
 Detour g_xamInputSetStateDetour;
 Detour g_xamInputGetCapabilitiesDetour;
+Detour g_xamInputGetCapabilitiesStandardDetour;
 Detour g_xinputReadStateDetour;
 
 typedef struct _XINPUT_CAPABILITIESEX {
@@ -61,6 +63,7 @@ UsbNotificationFn g_usbdDriverEntry = 0;
 FreePhysicalMemoryFn g_freePhysicalMemory = 0;
 void* g_xamInputSetState = 0;
 void* g_xamInputGetCapabilities = 0;
+void* g_xamInputGetCapabilitiesStandard = 0;
 void* g_xinputReadState = 0;
 bool g_isDevkit = true;
 DWORD g_usbPhysicalPage = 0;
@@ -105,7 +108,6 @@ HANDLE MakeSystemThread(LPTHREAD_START_ROUTINE entry, PVOID argument) {
 	if (!thread) return 0;
 	XSetThreadProcessor(thread, kUsbProcessor);
 	SetThreadPriority(thread, THREAD_PRIORITY_NORMAL);
-	ResumeThread(thread);
 	return thread;
 }
 
@@ -216,7 +218,7 @@ void ProcessProteusEvents() {
 			BindController(i);
 }
 
-unsigned int __stdcall ProteusServiceThreadProc(void*) {
+DWORD WINAPI ProteusServiceThreadProc(void*) {
 	if (GetCurrentProcessorNumber() != kUsbProcessor) {
 		DbgPrint("TritonDriver: USB service affinity incorrect; refusing unsafe USB maintenance\n");
 		return ERROR_INVALID_FUNCTION;
@@ -279,22 +281,81 @@ DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_STATE* state,
 	return status;
 }
 
+bool IsLiveController(int index) {
+	TritonVirtualController& controller = g_controllers[index];
+	if (!controller.inUse || controller.userIndex >= kControllerCount ||
+		!ProteusRouting::IsValidSlotIndex(controller.slotIndex)) return false;
+	ProteusRoutingSlot& slot = g_proteusSlots[controller.slotIndex];
+	return !slot.disconnectPending && ProteusRouting::AssociationMatches(
+		slot.connected != 0, slot.controllerIndex, (uint32_t)slot.generation,
+		controller.inUse != 0, controller.slotIndex, controller.slotGeneration, index);
+}
+
+bool HasCapabilityController(DWORD user, DWORD flags) {
+	if (!ControllerCapabilities::AcceptsGamepad(flags)) return false;
+	bool any = ControllerCapabilities::AnyUser(user, flags);
+	for (int i = 0; i < kControllerCount; ++i)
+		if (IsLiveController(i) && (any || g_controllers[i].userIndex == user)) return true;
+	return false;
+}
+
+// Log the first occurrence of each result class per entry point and user.
+// This stays bounded even when a title polls capabilities every frame.
+void TraceInputQuery(int path, DWORD user, DWORD flags, DWORD status, bool supplied) {
+	static volatile LONG seen[2][6][4] = {};
+	int userBucket = user < 4 ? (int)user :
+		(ControllerCapabilities::AnyUser(user, flags) ? 4 : 5);
+	int resultBucket = status == ERROR_SUCCESS ? 0 :
+		(status == ERROR_DEVICE_NOT_CONNECTED ? 1 : (status == ERROR_EMPTY ? 2 : 3));
+	if (InterlockedCompareExchange(&seen[path][userBucket][resultBucket], 1, 0) == 0)
+		DbgPrint("TritonDriver: input query path %d user %x flags %x status %x virtual %d\n",
+			path, user, flags, status, supplied ? 1 : 0);
+}
+
+DWORD XamInputGetCapabilitiesStandardHook(DWORD user, DWORD flags,
+	PXINPUT_CAPABILITIES capabilities) {
+	bool supplied = capabilities && HasCapabilityController(user, flags);
+	DWORD status;
+	if (ControllerCapabilities::AnyUser(user, flags)) {
+		status = g_xamInputGetCapabilitiesStandardDetour.GetOriginal<decltype(&XamInputGetCapabilitiesStandardHook)>()(
+			user, flags, capabilities);
+		if (status != ERROR_DEVICE_NOT_CONNECTED || !supplied) {
+			TraceInputQuery(0, user, flags, status, false);
+			return status;
+		}
+	}
+	if (supplied) {
+		ControllerCapabilities::Fill(capabilities);
+		status = ERROR_SUCCESS;
+	} else {
+		status = g_xamInputGetCapabilitiesStandardDetour.GetOriginal<decltype(&XamInputGetCapabilitiesStandardHook)>()(
+			user, flags, capabilities);
+	}
+	TraceInputQuery(0, user, flags, status, supplied);
+	return status;
+}
+
 DWORD XamInputGetCapabilitiesHook(DWORD unknown, DWORD user, DWORD flags,
 	PXINPUT_CAPABILITIES_EX capabilities) {
-	DWORD status = g_xamInputGetCapabilitiesDetour.GetOriginal<decltype(&XamInputGetCapabilitiesHook)>()(
-		unknown, user, flags, capabilities);
-	if ((user & 0xff) == 0xff) user = 0;
-	if (!capabilities || status != ERROR_DEVICE_NOT_CONNECTED || !FindControllerByUser(user)) return status;
-	capabilities->Type = XINPUT_DEVTYPE_GAMEPAD;
-	capabilities->SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
-	capabilities->Flags = 0;
-	XINPUT_STATE state;
-	memset(&state, 0, sizeof(state));
-	XInputGetState(user, &state);
-	capabilities->Gamepad = state.Gamepad;
-	capabilities->Vibration.wLeftMotorSpeed = 0;
-	capabilities->Vibration.wRightMotorSpeed = 0;
-	return ERROR_SUCCESS;
+	bool supplied = capabilities && HasCapabilityController(user, flags);
+	DWORD status;
+	if (ControllerCapabilities::AnyUser(user, flags)) {
+		status = g_xamInputGetCapabilitiesDetour.GetOriginal<decltype(&XamInputGetCapabilitiesHook)>()(
+			unknown, user, flags, capabilities);
+		if (status != ERROR_DEVICE_NOT_CONNECTED || !supplied) {
+			TraceInputQuery(1, user, flags, status, false);
+			return status;
+		}
+	}
+	if (supplied) {
+		ControllerCapabilities::Fill(capabilities);
+		status = ERROR_SUCCESS;
+	} else {
+		status = g_xamInputGetCapabilitiesDetour.GetOriginal<decltype(&XamInputGetCapabilitiesHook)>()(
+			unknown, user, flags, capabilities);
+	}
+	TraceInputQuery(1, user, flags, status, supplied);
+	return status;
 }
 
 NTSTATUS XInputdReadStateHook(DWORD context, PDWORD packetNumber,
@@ -366,6 +427,7 @@ bool InitializeFunctionPointers() {
 	XexGetProcedureAddress(kernel, 189, &g_freePhysicalMemory);
 	XexGetProcedureAddress(kernel, 486, &g_xinputReadState);
 	XexGetProcedureAddress(xam, 685, &g_xamInputGetCapabilities);
+	XexGetProcedureAddress(xam, 400, &g_xamInputGetCapabilitiesStandard);
 	XexGetProcedureAddress(xam, 402, &g_xamInputSetState);
 	if (g_isDevkit) {
 		UsbdGetInterfaceDescriptor = (UsbInterfaceDescriptorFn)0x8010D2D0;
@@ -392,7 +454,8 @@ bool InitializeFunctionPointers() {
 		UsbdAddDeviceComplete && UsbdOpenDefaultEndpoint && UsbdOpenEndpoint &&
 		UsbdQueueAsyncTransfer && UsbdRemoveDeviceComplete && XamUserBindDeviceCallback &&
 		g_usbdPowerDownNotification && g_usbdDriverEntry && g_freePhysicalMemory &&
-		g_xinputReadState && g_xamInputGetCapabilities && g_xamInputSetState;
+		g_xinputReadState && g_xamInputGetCapabilities && g_xamInputSetState &&
+		g_xamInputGetCapabilitiesStandard;
 }
 
 void ProteusPublishState(uint8_t interfaceNumber,
@@ -426,6 +489,10 @@ BOOL APIENTRY DllMain(HANDLE, DWORD reason, PVOID) {
 	DbgPrint("TritonDriver: starting Triton-over-Proteus driver\n");
 	if (!InitializeFunctionPointers()) return FALSE;
 	InitializeRouting();
+	// Fail before installing hooks if the worker cannot be created. Returning
+	// FALSE with live hooks would leave kernel calls targeting an unloaded DLL.
+	HANDLE serviceThread = MakeSystemThread(ProteusServiceThreadProc, 0);
+	if (!serviceThread) return FALSE;
 	if (g_isDevkit) {
 		g_hidAddDeviceDetour = Detour((void*)0x8011AE38, (void*)HidAddDeviceHook);
 		g_hidRemoveDeviceDetour = Detour((void*)0x8011ADF8, (void*)HidRemoveDeviceHook);
@@ -436,16 +503,17 @@ BOOL APIENTRY DllMain(HANDLE, DWORD reason, PVOID) {
 	g_hidAddDeviceDetour.Install();
 	g_hidRemoveDeviceDetour.Install();
 	g_xamInputGetCapabilitiesDetour = Detour(g_xamInputGetCapabilities, (void*)XamInputGetCapabilitiesHook);
+	g_xamInputGetCapabilitiesStandardDetour = Detour(g_xamInputGetCapabilitiesStandard, (void*)XamInputGetCapabilitiesStandardHook);
 	g_xamInputSetStateDetour = Detour(g_xamInputSetState, (void*)XamInputSetStateHook);
 	g_xinputReadStateDetour = Detour(g_xinputReadState, (void*)XInputdReadStateHook);
 	g_xamInputSetStateDetour.Install();
 	g_xamInputGetCapabilitiesDetour.Install();
+	g_xamInputGetCapabilitiesStandardDetour.Install();
 	g_xinputReadStateDetour.Install();
 	g_usbdPowerDownNotification();
 	g_freePhysicalMemory(0, *(DWORD*)g_usbPhysicalPage);
 	g_usbdDriverEntry();
-	HANDLE serviceThread = MakeSystemThread((LPTHREAD_START_ROUTINE)ProteusServiceThreadProc, 0);
-	if (!serviceThread) return FALSE;
+	ResumeThread(serviceThread);
 	CloseHandle(serviceThread);
 	return TRUE;
 }
