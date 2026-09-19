@@ -18,7 +18,7 @@ the puck to the console.
 
 ## Installation and use
 
-1. Copy `tritondriver.xex` to the console.
+1. Download `tritondriver.xex` from [here](https://github.com/AustinJMann/tritondriver360/releases/latest) and copy it to the console.
 2. Load it at runtime or add it to the plugin list in `launch.ini`.
 3. Connect the Proteus puck and power on the paired Triton controllers.
 
