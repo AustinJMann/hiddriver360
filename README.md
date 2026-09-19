@@ -22,19 +22,17 @@ the puck to the console.
 2. Load it at runtime or add it to the plugin list in `launch.ini`.
 3. Connect the Proteus puck and power on the paired Triton controllers.
 
-Proteus interfaces 2 through 5 correspond to four independent wireless slots.
 Each connected Triton is registered as a virtual Xbox 360 controller when an
 XAM player position is available. A connected slot that cannot bind immediately
-is retried automatically. Disconnects, reconnects, controller power cycles, and
-slot rebinding are handled by the background Proteus service.
+is retried automatically.
 
 Supported input includes face buttons, D-pad, shoulders, stick clicks, menu and
-view, both sticks, analog triggers, and the guide button. The driver periodically
-suppresses the firmware keyboard/mouse fallback while a controller is active.
+view, both sticks, analog triggers, and the guide button.
 
-Rumble forwards each virtual controller's left/right motor strengths to its
-Proteus slot, with periodic refresh, coalescing, and retry handling. Rumble has
-been confirmed working on console in Black Ops II.
+Rumble is implemented and works, but it might feel weird in some games.
+This is a know issue when converting rumble designed for use with a motor to the
+Trition controller. I have implemented a curve and cutoff that makes it feel better,
+but some games still feel a bit off or cause a rumble pulsing feeling.
 
 ## Current limitations
 
