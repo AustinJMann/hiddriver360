@@ -17,6 +17,20 @@ inline uint16_t Left(uint64_t request) { return (uint16_t)(request >> 16); }
 inline uint16_t Right(uint64_t request) { return (uint16_t)request; }
 inline bool Active(uint64_t request) { return (uint32_t)request != 0; }
 
+// Route by ownership, never by the native driver's return code. XAM may accept
+// a virtual device without delivering its motor values to our USB transport.
+// Backend keeps platform-specific binding checks and atomic publication outside
+// this dispatch policy so host tests exercise the same decision as the hook.
+template <typename Vibration, typename Backend>
+uint32_t SetState(uint32_t user, uint32_t flags, Vibration* vibration, Backend& backend) {
+	uint32_t normalizedUser = (user & 0xff) == 0xff ? 0 : user;
+	typename Backend::Target target;
+	if (!backend.Find(normalizedUser, &target))
+		return backend.Native(user, flags, vibration);
+	if (!vibration) return 87; // ERROR_INVALID_PARAMETER
+	return backend.Submit(target, vibration->wLeftMotorSpeed, vibration->wRightMotorSpeed);
+}
+
 // Zero-initializable; used only on the USB processor at dispatch IRQL.
 // desired is a snapshot of the atomic, generation-tagged XAM mailbox.
 struct State {

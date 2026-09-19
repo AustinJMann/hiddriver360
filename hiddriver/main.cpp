@@ -286,32 +286,58 @@ int HidAddDeviceHook(deviceHandle* handle) {
 	return g_hidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(handle);
 }
 
-DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_VIBRATION* vibration) {
-	DWORD status = g_xamInputSetStateDetour.GetOriginal<decltype(&XamInputSetStateHook)>()(
-		user, flags, vibration);
-	if ((user & 0xff) == 0xff) user = 0;
-	TritonVirtualController* controller = FindControllerByUser(user);
-	if (status != ERROR_DEVICE_NOT_CONNECTED || !controller) return status;
-	if (!vibration) return ERROR_INVALID_PARAMETER;
-	int slotIndex = controller->slotIndex;
-	uint32_t generation = controller->slotGeneration;
-	if (!ProteusRouting::IsValidSlotIndex(slotIndex)) return ERROR_DEVICE_NOT_CONNECTED;
-	ProteusRoutingSlot& slot = g_proteusSlots[slotIndex];
-	int controllerIndex = (int)(controller - g_controllers);
-	if (slot.disconnectPending || !ProteusRouting::AssociationMatches(
-		slot.connected != 0, slot.controllerIndex, (uint32_t)slot.generation,
-		controller->inUse != 0, slotIndex, generation, controllerIndex) ||
-		controller->userIndex != user) return ERROR_DEVICE_NOT_CONNECTED;
-	LONG64 desired = (LONG64)RumbleOutput::Request(generation,
-		vibration->wLeftMotorSpeed, vibration->wRightMotorSpeed);
-	for (int attempt = 0; attempt < 8; ++attempt) {
-		LONG64 previous = InterlockedCompareExchange64(&g_rumbleRequests[slotIndex], 0, 0);
-		if (!generation || RumbleOutput::Generation((uint64_t)previous) != generation)
-			return ERROR_DEVICE_NOT_CONNECTED;
-		if (InterlockedCompareExchange64(&g_rumbleRequests[slotIndex], desired, previous) == previous)
-			return ERROR_SUCCESS;
+DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_VIBRATION* vibration);
+
+struct XboxRumbleBackend {
+	struct Target {
+		DWORD user;
+		int controllerIndex;
+		int slotIndex;
+		uint32_t generation;
+	};
+
+	bool Find(uint32_t user, Target* target) {
+		TritonVirtualController* controller = FindControllerByUser(user);
+		if (!controller) return false;
+		target->user = user;
+		target->controllerIndex = (int)(controller - g_controllers);
+		target->slotIndex = controller->slotIndex;
+		target->generation = controller->slotGeneration;
+		return true;
 	}
-	return ERROR_BUSY;
+
+	uint32_t Native(uint32_t user, uint32_t flags, XINPUT_VIBRATION* vibration) {
+		return g_xamInputSetStateDetour.GetOriginal<decltype(&XamInputSetStateHook)>()(
+			user, flags, vibration);
+	}
+
+	uint32_t Submit(const Target& target, uint16_t left, uint16_t right) {
+		int slotIndex = target.slotIndex;
+		uint32_t generation = target.generation;
+		if (!ProteusRouting::IsValidSlotIndex(slotIndex)) return ERROR_DEVICE_NOT_CONNECTED;
+		ProteusRoutingSlot& slot = g_proteusSlots[slotIndex];
+		int controllerIndex = target.controllerIndex;
+		TritonVirtualController* controller = &g_controllers[controllerIndex];
+		if (slot.disconnectPending || !ProteusRouting::AssociationMatches(
+			slot.connected != 0, slot.controllerIndex, (uint32_t)slot.generation,
+			controller->inUse != 0, slotIndex, generation, controllerIndex) ||
+			controller->userIndex != target.user || controller->slotIndex != slotIndex ||
+			controller->slotGeneration != generation) return ERROR_DEVICE_NOT_CONNECTED;
+		LONG64 desired = (LONG64)RumbleOutput::Request(generation, left, right);
+		for (int attempt = 0; attempt < 8; ++attempt) {
+			LONG64 previous = InterlockedCompareExchange64(&g_rumbleRequests[slotIndex], 0, 0);
+			if (!generation || RumbleOutput::Generation((uint64_t)previous) != generation)
+				return ERROR_DEVICE_NOT_CONNECTED;
+			if (InterlockedCompareExchange64(&g_rumbleRequests[slotIndex], desired, previous) == previous)
+				return ERROR_SUCCESS;
+		}
+		return ERROR_BUSY;
+	}
+};
+
+DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_VIBRATION* vibration) {
+	XboxRumbleBackend backend;
+	return RumbleOutput::SetState(user, flags, vibration, backend);
 }
 
 bool IsLiveController(int index) {

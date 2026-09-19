@@ -33,15 +33,13 @@ view, both sticks, analog triggers, and the guide button. The driver periodicall
 suppresses the firmware keyboard/mouse fallback while a controller is active.
 
 Rumble forwards each virtual controller's left/right motor strengths to its
-Proteus slot, with periodic refresh, coalescing, and retry handling. See the
-[rumble validation guide](docs/rumble-validation.md) for transport details and
-the hardware acceptance checklist.
+Proteus slot, with periodic refresh, coalescing, and retry handling. Rumble has
+been confirmed working on console in Black Ops II.
 
 ## Current limitations
 
 - Triton-over-Proteus only; direct USB, Bluetooth, and BLE are unsupported.
 - One Proteus puck, with up to four paired controllers.
-- Experimental rumble over Proteus; console validation is still required.
 - No touch or IMU input.
 - Four simultaneous physical Tritons have not yet been hardware-validated.
 
@@ -59,7 +57,7 @@ USB stack and are not claimed by TritonDriver.
 4. Build `Release Retail|Xbox 360`. The deployable output is
    `tritondriver.xex`.
 
-Host protocol, USB descriptor, and routing tests are in
+Host protocol, rumble routing and scheduling, and USB descriptor tests are in
 `tests/triton_protocol_tests.vcxproj`. Run them from a Visual Studio 2022
 Developer PowerShell prompt with the desktop C++ tools installed:
 

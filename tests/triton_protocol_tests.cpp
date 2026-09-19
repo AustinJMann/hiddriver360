@@ -177,6 +177,56 @@ static void TestUsbDescriptors() {
 	assert(!UsbDescriptors::IsInterruptInEndpoint(endpoint));
 }
 
+static void TestUsbOutputDescriptors() {
+	// Synthetic fixture: OUT addresses differ from IN. An alternate setting and
+	// a different slot must never supply the target slot's output endpoint.
+	const uint8_t configuration[] = {
+		9, 2, 78, 0, 2, 1, 0, 0x80, 50,
+		9, 4, 2, 0, 2, 3, 0, 0, 0,
+		7, 5, 0x82, 3, 64, 0, 1,
+		7, 5, 0x05, 3, 32, 0, 2,
+		9, 4, 2, 1, 2, 3, 0, 0, 0,
+		7, 5, 0x86, 3, 64, 0, 1,
+		7, 5, 0x06, 3, 64, 0, 1,
+		9, 4, 3, 0, 2, 3, 0, 0, 0,
+		7, 5, 0x83, 3, 64, 0, 1,
+		7, 5, 0x07, 3, 64, 0, 1
+	};
+	usb_endpoint_descriptor endpoint = {};
+	assert(UsbDescriptors::FindInterruptOutEndpoint(configuration, sizeof(configuration), 2, &endpoint));
+	assert(endpoint.bEndpointAddress == 5 && endpoint.bInterval == 2);
+	assert(ReadLE16((const uint8_t*)&endpoint.wMaxPacketSize) == 32);
+	assert(UsbDescriptors::IsInterruptOutEndpoint(endpoint));
+	assert(!UsbDescriptors::IsInterruptInEndpoint(endpoint));
+	assert(UsbDescriptors::FindInterruptInEndpoint(configuration, sizeof(configuration), 2, &endpoint));
+	assert(endpoint.bEndpointAddress == 0x82);
+	assert(!UsbDescriptors::IsInterruptOutEndpoint(endpoint));
+	assert(UsbDescriptors::FindInterruptOutEndpoint(configuration, sizeof(configuration), 3, &endpoint));
+	assert(endpoint.bEndpointAddress == 7);
+	assert(!UsbDescriptors::FindInterruptOutEndpoint(configuration, sizeof(configuration), 4, &endpoint));
+	assert(endpoint.bEndpointAddress == 7);
+	for (size_t length = 0; length < sizeof(configuration); ++length) {
+		assert(!UsbDescriptors::FindInterruptOutEndpoint(configuration, length, 2, &endpoint));
+		assert(endpoint.bEndpointAddress == 7);
+	}
+	uint8_t malformed[sizeof(configuration)];
+	const size_t offsets[] = { 9, 18, 25, 32, 41, 48, 55, 64, 71 };
+	for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
+		memcpy(malformed, configuration, sizeof(configuration));
+		malformed[offsets[i]] = 1;
+		assert(!UsbDescriptors::FindInterruptOutEndpoint(malformed, sizeof(malformed), 2, &endpoint));
+		assert(endpoint.bEndpointAddress == 7);
+	}
+	const size_t badOffsets[] = { 12, 14, 15, 16, 27, 27, 27, 28 };
+	const uint8_t badValues[] = { 1, 2, 1, 1, 0, 0x85, 0x75, 2 };
+	for (size_t i = 0; i < sizeof(badOffsets) / sizeof(badOffsets[0]); ++i) {
+		memcpy(malformed, configuration, sizeof(configuration));
+		malformed[badOffsets[i]] = badValues[i];
+		assert(!UsbDescriptors::FindInterruptOutEndpoint(malformed, sizeof(malformed), 2, &endpoint));
+		assert(endpoint.bEndpointAddress == 7);
+	}
+}
+
 static void TestAdmissionAndValidation() {
 	for (uint8_t interfaceNumber = kFirstSlotInterface;
 		interfaceNumber <= kLastSlotInterface; ++interfaceNumber)
@@ -452,6 +502,86 @@ static void TestControllerCapabilities() {
 	assert(!ControllerCapabilities::AnyUser(4, 0));
 }
 
+struct TestVibration {
+	uint16_t wLeftMotorSpeed;
+	uint16_t wRightMotorSpeed;
+};
+
+struct TestRumbleBackend {
+	typedef int Target;
+	bool ownsUser;
+	uint32_t nativeResult;
+	uint32_t submitResult;
+	uint32_t nativeCalls;
+	uint32_t submitCalls;
+	uint32_t lookupUser;
+	uint32_t nativeUser;
+	uint32_t nativeFlags;
+	TestVibration* nativeVibration;
+	uint16_t left;
+	uint16_t right;
+
+	bool Find(uint32_t user, Target* target) {
+		lookupUser = user;
+		*target = 7;
+		return ownsUser;
+	}
+	uint32_t Native(uint32_t user, uint32_t flags, TestVibration* vibration) {
+		++nativeCalls;
+		nativeUser = user;
+		nativeFlags = flags;
+		nativeVibration = vibration;
+		return nativeResult;
+	}
+	uint32_t Submit(Target target, uint16_t l, uint16_t r) {
+		assert(target == 7);
+		++submitCalls;
+		left = l;
+		right = r;
+		return submitResult;
+	}
+};
+
+static void TestRumbleXamDispatch() {
+	TestRumbleBackend backend = {};
+	TestVibration vibration = { 0x1234, 0xabcd };
+	backend.ownsUser = true;
+	// Regress the silent-drop case: native success must not swallow output for
+	// a controller owned by this driver. Native is never called in that case.
+	assert(RumbleOutput::SetState(2, 0, &vibration, backend) == 0);
+	assert(backend.submitCalls == 1 && backend.nativeCalls == 0);
+	assert(backend.lookupUser == 2 && backend.left == 0x1234 && backend.right == 0xabcd);
+	backend.nativeResult = 1167;
+	vibration.wLeftMotorSpeed = vibration.wRightMotorSpeed = 0;
+	assert(RumbleOutput::SetState(2, 0, &vibration, backend) == 0);
+	assert(backend.submitCalls == 2 && backend.nativeCalls == 0);
+	assert(backend.left == 0 && backend.right == 0); // Stop takes the same route.
+	assert(RumbleOutput::SetState(2, 0, (TestVibration*)0, backend) == 87);
+	assert(backend.submitCalls == 2 && backend.nativeCalls == 0);
+	backend.submitResult = 1167; // Binding disappeared before atomic publication.
+	assert(RumbleOutput::SetState(2, 0, &vibration, backend) == 1167);
+	assert(backend.nativeCalls == 0);
+	backend.submitResult = 170; // Contended mailbox failure propagates.
+	assert(RumbleOutput::SetState(2, 0, &vibration, backend) == 170);
+	backend.submitResult = 0;
+	assert(RumbleOutput::SetState(0xffffffffu, 0, &vibration, backend) == 0);
+	assert(backend.lookupUser == 0);
+	assert(RumbleOutput::SetState(0xff, 0, &vibration, backend) == 0);
+	assert(backend.lookupUser == 0);
+
+	backend.ownsUser = false;
+	uint32_t submitted = backend.submitCalls;
+	assert(RumbleOutput::SetState(0xffffffffu, 0x40000000u, &vibration, backend) == 1167);
+	assert(backend.nativeUser == 0xffffffffu && backend.nativeFlags == 0x40000000u);
+	assert(backend.nativeVibration == &vibration && backend.submitCalls == submitted);
+	backend.nativeResult = 0;
+	assert(RumbleOutput::SetState(1, 123, &vibration, backend) == 0);
+	assert(backend.nativeUser == 1 && backend.nativeFlags == 123);
+	backend.nativeResult = 87;
+	assert(RumbleOutput::SetState(1, 0, (TestVibration*)0, backend) == 87);
+	assert(backend.nativeVibration == 0 && backend.submitCalls == submitted);
+}
+
 static void TestRumbleEncoding() {
 	uint8_t report[kRumbleReportSize + 2];
 	memset(report, 0xcc, sizeof(report));
@@ -560,6 +690,8 @@ static void TestRumbleWrapAndSlotIsolation() {
 }
 
 int main() {
+	TestUsbOutputDescriptors();
+	TestRumbleXamDispatch();
 	TestControllerCapabilities();
 	TestRumbleEncoding();
 	TestRumbleRefreshAndCoalescing();
