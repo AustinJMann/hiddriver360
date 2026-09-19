@@ -550,7 +550,9 @@ static void TestRumbleXamDispatch() {
 	// a controller owned by this driver. Native is never called in that case.
 	assert(RumbleOutput::SetState(2, 0, &vibration, backend) == 0);
 	assert(backend.submitCalls == 1 && backend.nativeCalls == 0);
-	assert(backend.lookupUser == 2 && backend.left == 0x1234 && backend.right == 0xabcd);
+	assert(backend.lookupUser == 2);
+	assert(backend.left == RumbleOutput::ScaleIntensity(0x1234));
+	assert(backend.right == RumbleOutput::ScaleIntensity(0xabcd));
 	backend.nativeResult = 1167;
 	vibration.wLeftMotorSpeed = vibration.wRightMotorSpeed = 0;
 	assert(RumbleOutput::SetState(2, 0, &vibration, backend) == 0);
@@ -580,6 +582,20 @@ static void TestRumbleXamDispatch() {
 	backend.nativeResult = 87;
 	assert(RumbleOutput::SetState(1, 0, (TestVibration*)0, backend) == 87);
 	assert(backend.nativeVibration == 0 && backend.submitCalls == submitted);
+}
+
+static void TestRumbleDeadzoneAndCubicScaling() {
+	using RumbleOutput::ScaleIntensity;
+	assert(ScaleIntensity(0) == 0);
+	assert(ScaleIntensity(RumbleOutput::kIntensityDeadzone - 1) == 0);
+	assert(ScaleIntensity(RumbleOutput::kIntensityDeadzone) == 0);
+	assert(ScaleIntensity(RumbleOutput::kIntensityDeadzone + 1) <= 1);
+	uint16_t activeMidpoint = (uint16_t)(RumbleOutput::kIntensityDeadzone +
+		(0xffffu - RumbleOutput::kIntensityDeadzone) / 2);
+	assert(ScaleIntensity(activeMidpoint) >= 8191 && ScaleIntensity(activeMidpoint) <= 8193);
+	assert(ScaleIntensity(0xffff) == 0xffff);
+	for (uint32_t value = 1; value <= 0xffff; ++value)
+		assert(ScaleIntensity((uint16_t)value) >= ScaleIntensity((uint16_t)(value - 1)));
 }
 
 static void TestRumbleEncoding() {
@@ -692,6 +708,7 @@ static void TestRumbleWrapAndSlotIsolation() {
 int main() {
 	TestUsbOutputDescriptors();
 	TestRumbleXamDispatch();
+	TestRumbleDeadzoneAndCubicScaling();
 	TestControllerCapabilities();
 	TestRumbleEncoding();
 	TestRumbleRefreshAndCoalescing();

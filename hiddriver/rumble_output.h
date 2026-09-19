@@ -8,6 +8,10 @@ namespace RumbleOutput {
 // scheduling headroom for the shared control endpoint on the Xbox.
 static const uint32_t kRefreshMs = 30;
 static const uint32_t kServiceMs = 5;
+// Ignore the small motor pulses some games use before their main rumble event.
+// Kept as a named threshold so hardware testing can tune it independently of
+// the response curve.
+static const uint16_t kIntensityDeadzone = 6554; // 10% of the XInput range.
 
 inline uint64_t Request(uint32_t generation, uint16_t left, uint16_t right) {
 	return ((uint64_t)generation << 32) | ((uint32_t)left << 16) | right;
@@ -16,6 +20,17 @@ inline uint32_t Generation(uint64_t request) { return (uint32_t)(request >> 32);
 inline uint16_t Left(uint64_t request) { return (uint16_t)(request >> 16); }
 inline uint16_t Right(uint64_t request) { return (uint16_t)request; }
 inline bool Active(uint64_t request) { return (uint32_t)request != 0; }
+
+// Remove the low-end hardware floor, then apply a cubic response over the
+// remaining range. Renormalizing after the deadzone preserves full output.
+inline uint16_t ScaleIntensity(uint16_t value) {
+	if (value <= kIntensityDeadzone) return 0;
+	const uint32_t span = 65535u - kIntensityDeadzone;
+	const uint32_t adjusted = (uint32_t)value - kIntensityDeadzone;
+	const uint32_t normalized = (adjusted * 65535u + span / 2) / span;
+	const uint32_t squared = (normalized * normalized + 32767u) / 65535u;
+	return (uint16_t)((squared * normalized + 32767u) / 65535u);
+}
 
 // Route by ownership, never by the native driver's return code. XAM may accept
 // a virtual device without delivering its motor values to our USB transport.
@@ -28,7 +43,8 @@ uint32_t SetState(uint32_t user, uint32_t flags, Vibration* vibration, Backend& 
 	if (!backend.Find(normalizedUser, &target))
 		return backend.Native(user, flags, vibration);
 	if (!vibration) return 87; // ERROR_INVALID_PARAMETER
-	return backend.Submit(target, vibration->wLeftMotorSpeed, vibration->wRightMotorSpeed);
+	return backend.Submit(target, ScaleIntensity(vibration->wLeftMotorSpeed),
+		ScaleIntensity(vibration->wRightMotorSpeed));
 }
 
 // Zero-initializable; used only on the USB processor at dispatch IRQL.
